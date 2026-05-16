@@ -69,7 +69,7 @@ with st.sidebar:
     )
 
     st.divider()
-    max_videos = st.slider("Videos to analyze", 5, 50, 20, step=5)
+    max_videos = st.slider("Videos to analyze", 5, 100, 50, step=5)
     max_comments = st.slider("Comments per video", 20, 200, 100, step=20)
 
     quota_estimate = max_videos * 2 + max_videos * (max_comments // 100)

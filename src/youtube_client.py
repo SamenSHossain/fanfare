@@ -67,7 +67,7 @@ class YouTubeClient:
         except HttpError:
             return {}
 
-    def get_video_ids(self, uploads_playlist_id: str, max_videos: int = 50) -> list[str]:
+    def get_video_ids(self, uploads_playlist_id: str, max_videos: int = 100) -> list[str]:
         video_ids: list[str] = []
         next_page_token = None
 
