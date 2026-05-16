@@ -50,7 +50,7 @@ with st.sidebar:
     fetch_btn = st.button("Fetch & Analyze", type="primary", use_container_width=True)
 
     st.divider()
-    st.caption("YouTube Data API v3 · VADER Sentiment · No credit card required")
+    st.caption("YouTube Data API v3 · No credit card required")
 
 
 # ── Cached data loader ─────────────────────────────────────────────────────────
@@ -404,6 +404,13 @@ with tab_sent:
             )
             st.plotly_chart(fig_trend, use_container_width=True)
 
+        # Model attribution
+        has_roberta = "roberta_compound" in comments_df.columns
+        if has_roberta:
+            st.caption("Sentiment model: **RoBERTa** (cardiffnlp/twitter-roberta-base-sentiment-latest) · VADER retained as baseline")
+        else:
+            st.caption("Sentiment model: **VADER** (RoBERTa unavailable — check that `transformers` and `torch` are installed)")
+
         st.subheader("Sample Comments")
         col_pos, col_neg = st.columns(2)
 
@@ -420,6 +427,41 @@ with tab_sent:
                 st.error(
                     f"**{row['author']}** · score {row['sentiment_score']:+.2f}\n\n{str(row['text'])[:250]}"
                 )
+
+        # VADER vs RoBERTa disagreement chart — only shown when both ran
+        if has_roberta:
+            st.subheader("Where VADER and RoBERTa Disagree")
+            st.caption(
+                "Comments far from the diagonal are where RoBERTa's social-media training matters most — "
+                "sarcasm, slang, and context that confuse a rule-based lexicon."
+            )
+            fig_cmp = px.scatter(
+                comments_df,
+                x="vader_compound",
+                y="roberta_compound",
+                color="sentiment_label",
+                color_discrete_map={
+                    "Positive": "#27AE60",
+                    "Neutral": "#95A5A6",
+                    "Negative": "#E74C3C",
+                },
+                hover_data=["author", "text"],
+                opacity=0.6,
+                labels={
+                    "vader_compound": "VADER score",
+                    "roberta_compound": "RoBERTa score",
+                    "sentiment_label": "Label (RoBERTa)",
+                },
+                title="VADER vs RoBERTa Scores — points off the diagonal = model disagreement",
+            )
+            # Perfect-agreement diagonal
+            fig_cmp.add_shape(
+                type="line", x0=-1, y0=-1, x1=1, y1=1,
+                line=dict(color="#BDC3C7", width=1, dash="dash"),
+            )
+            fig_cmp.add_vline(x=0, line_dash="dot", line_color="#BDC3C7", line_width=1)
+            fig_cmp.add_hline(y=0, line_dash="dot", line_color="#BDC3C7", line_width=1)
+            st.plotly_chart(fig_cmp, use_container_width=True)
 
 
 # ┌─ Top Fans ───────────────────────────────────────────────────────────────────
@@ -622,13 +664,18 @@ with tab_topics:
                     ["keyword", "mentions", "avg_sentiment", "positive_pct", "signal"]
                 ].copy()
                 kw_display.columns = [
-                    "Keyword",
-                    "Mentions",
+                    "Keyword / Phrase",
+                    "Comments",
                     "Avg Sentiment",
                     "Positive %",
                     "Action",
                 ]
                 st.dataframe(kw_display, use_container_width=True, hide_index=True)
+
+            # Show whether TF-IDF + bigrams are active
+            has_tfidf = "tfidf_score" in topics_df.columns
+            if has_tfidf:
+                st.caption("Ranked by TF-IDF score (unigrams + bigrams) — phrases shown where fans use them together")
 
 
 # ┌─ All Videos ──────────────────────────────────────────────────────────────────

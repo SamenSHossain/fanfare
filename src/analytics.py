@@ -3,6 +3,12 @@ from collections import Counter
 
 import pandas as pd
 
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer as _TfidfVectorizer
+    _SKLEARN_AVAILABLE = True
+except ImportError:
+    _SKLEARN_AVAILABLE = False
+
 _STOPWORDS = {
     "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
     "of", "with", "as", "is", "was", "are", "were", "be", "been", "being",
@@ -51,9 +57,36 @@ def get_top_fans(comments_df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
 
 def get_trending_topics(comments_df: pd.DataFrame, top_n: int = 30) -> pd.DataFrame:
     if comments_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["word", "count"])
 
-    text = " ".join(comments_df["text"].astype(str).tolist()).lower()
+    texts = comments_df["text"].astype(str).str.lower().tolist()
+
+    if _SKLEARN_AVAILABLE and len(texts) >= 2:
+        try:
+            vec = _TfidfVectorizer(
+                ngram_range=(1, 2),   # unigrams + bigrams
+                max_features=500,
+                stop_words=list(_STOPWORDS),
+                min_df=2,             # phrase must appear in at least 2 comments
+                token_pattern=r"(?u)\b[a-z]{3,}\b",
+                sublinear_tf=True,    # log(tf+1) — prevents ultra-common words dominating
+            )
+            tfidf = vec.fit_transform(texts)
+            names = vec.get_feature_names_out()
+            agg_tfidf = tfidf.sum(axis=0).A1
+            doc_freq = (tfidf > 0).sum(axis=0).A1  # comments containing the phrase
+
+            top_idx = agg_tfidf.argsort()[::-1][:top_n]
+            return pd.DataFrame({
+                "word": names[top_idx],
+                "count": doc_freq[top_idx].astype(int),
+                "tfidf_score": agg_tfidf[top_idx].round(4),
+            }).reset_index(drop=True)
+        except ValueError:
+            pass  # too few terms — fall through to unigram fallback
+
+    # Fallback: plain unigram frequency (no sklearn or too few docs)
+    text = " ".join(texts)
     words = re.findall(r"\b[a-z]{3,}\b", text)
     filtered = [w for w in words if w not in _STOPWORDS]
     counts = Counter(filtered).most_common(top_n)
@@ -98,14 +131,20 @@ def keyword_sentiment_breakdown(
     comments_df: pd.DataFrame, keywords: list[str]
 ) -> pd.DataFrame:
     rows = []
-    for word in keywords:
-        pattern = r"\b" + re.escape(word) + r"\b"
+    for phrase in keywords:
+        parts = phrase.split()
+        if len(parts) == 1:
+            pattern = r"\b" + re.escape(phrase) + r"\b"
+        else:
+            # Bigram: word boundary on each end, flexible whitespace between tokens
+            pattern = r"\b" + r"\s+".join(re.escape(p) for p in parts) + r"\b"
+
         mask = comments_df["text"].str.lower().str.contains(pattern, regex=True, na=False)
         subset = comments_df[mask]
         if not subset.empty:
             rows.append(
                 {
-                    "keyword": word,
+                    "keyword": phrase,
                     "mentions": len(subset),
                     "avg_sentiment": round(subset["sentiment_score"].mean(), 3),
                     "positive_pct": round(
