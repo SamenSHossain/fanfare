@@ -10,6 +10,7 @@ from src.analytics import (
     get_trending_topics,
     keyword_sentiment_breakdown,
 )
+from src.cleaning import clean_comments
 from src.sentiment import batch_analyze
 from src.youtube_client import YouTubeClient
 
@@ -77,9 +78,23 @@ def load_data(
             drop=True
         )
 
-    comments_df = client.get_all_comments(video_ids, max_coms)
-    if not comments_df.empty:
-        comments_df = batch_analyze(comments_df)
+    raw_df = client.get_all_comments(video_ids, max_coms)
+    if raw_df.empty:
+        return channel, videos_df, pd.DataFrame()
+
+    # Stage 1: clean — adds cleaned_text, is_spam, language, is_duplicate
+    records = clean_comments(raw_df.to_dict("records"))
+    comments_df = pd.DataFrame(records)
+
+    # Stage 2: sentiment on clean subset only, using cleaned_text
+    clean_mask = ~comments_df["is_spam"] & ~comments_df["is_duplicate"]
+    if clean_mask.any():
+        clean_subset = batch_analyze(
+            comments_df[clean_mask].copy(), text_col="cleaned_text"
+        )
+        # Write new columns back to full DataFrame; spam/dupe rows get NaN
+        for col in [c for c in clean_subset.columns if c not in comments_df.columns]:
+            comments_df[col] = clean_subset[col]
 
     return channel, videos_df, comments_df
 
@@ -117,6 +132,16 @@ channel: dict = st.session_state.channel
 videos_df: pd.DataFrame = st.session_state.videos_df
 comments_df: pd.DataFrame = st.session_state.comments_df
 
+# Filtered view used by all analytics — excludes spam and near-duplicates.
+# comments_df (full) is kept for audit display in the All Videos tab.
+adf: pd.DataFrame = (
+    comments_df[~comments_df["is_spam"] & ~comments_df["is_duplicate"]].dropna(
+        subset=["sentiment_score"]
+    )
+    if not comments_df.empty and "is_spam" in comments_df.columns
+    else comments_df
+)
+
 # ── Channel hero ───────────────────────────────────────────────────────────────
 c1, c2 = st.columns([1, 8])
 with c1:
@@ -130,12 +155,14 @@ with c2:
 st.divider()
 
 # ── Top-level metrics ──────────────────────────────────────────────────────────
-m1, m2, m3, m4, m5 = st.columns(5)
+m1, m2, m3, m4, m5, m6 = st.columns(6)
 m1.metric("Subscribers", f"{channel['subscriber_count']:,}")
 m2.metric("Total Views", f"{channel['view_count']:,}")
 m3.metric("Total Videos", f"{channel['video_count']:,}")
 m4.metric("Videos Analyzed", len(videos_df) if not videos_df.empty else 0)
-m5.metric("Comments Scraped", len(comments_df) if not comments_df.empty else 0)
+m5.metric("Comments Fetched", len(comments_df) if not comments_df.empty else 0)
+_filtered = len(comments_df) - len(adf) if not comments_df.empty else 0
+m6.metric("After Cleaning", len(adf), delta=f"-{_filtered} spam/dupe" if _filtered else None)
 
 st.divider()
 
@@ -215,7 +242,7 @@ def _build_insights(
     return insights
 
 
-insights = _build_insights(videos_df, comments_df)
+insights = _build_insights(videos_df, adf)
 if insights:
     cols = st.columns(len(insights))
     for col, ins in zip(cols, insights):
@@ -307,13 +334,13 @@ with tab_eng:
 
 # ┌─ Sentiment ──────────────────────────────────────────────────────────────────
 with tab_sent:
-    if comments_df.empty:
-        st.warning("No comments were fetched — comments may be disabled on these videos.")
+    if adf.empty:
+        st.warning("No comments passed the spam/duplicate filter — comments may be disabled on these videos.")
     else:
         st.subheader("Fan Comment Sentiment")
 
-        counts = comments_df["sentiment_label"].value_counts()
-        avg_score = comments_df["sentiment_score"].mean()
+        counts = adf["sentiment_label"].value_counts()
+        avg_score = adf["sentiment_score"].mean()
 
         col_pie, col_gauge = st.columns(2)
 
@@ -375,7 +402,7 @@ with tab_sent:
             )
             st.plotly_chart(fig_gauge, use_container_width=True)
 
-        timeline_df = aggregate_sentiment_over_time(videos_df, comments_df)
+        timeline_df = aggregate_sentiment_over_time(videos_df, adf)
         if not timeline_df.empty:
             st.subheader("Sentiment Trend Across Videos")
             fig_trend = px.line(
@@ -405,7 +432,7 @@ with tab_sent:
             st.plotly_chart(fig_trend, use_container_width=True)
 
         # Model attribution
-        has_roberta = "roberta_compound" in comments_df.columns
+        has_roberta = "roberta_compound" in adf.columns
         if has_roberta:
             st.caption("Sentiment model: **RoBERTa** (cardiffnlp/twitter-roberta-base-sentiment-latest) · VADER retained as baseline")
         else:
@@ -416,14 +443,14 @@ with tab_sent:
 
         with col_pos:
             st.markdown("##### Most Positive")
-            for _, row in comments_df.nlargest(5, "sentiment_score").iterrows():
+            for _, row in adf.nlargest(5, "sentiment_score").iterrows():
                 st.success(
                     f"**{row['author']}** · score {row['sentiment_score']:+.2f}\n\n{str(row['text'])[:250]}"
                 )
 
         with col_neg:
             st.markdown("##### Most Critical")
-            for _, row in comments_df.nsmallest(5, "sentiment_score").iterrows():
+            for _, row in adf.nsmallest(5, "sentiment_score").iterrows():
                 st.error(
                     f"**{row['author']}** · score {row['sentiment_score']:+.2f}\n\n{str(row['text'])[:250]}"
                 )
@@ -436,7 +463,7 @@ with tab_sent:
                 "sarcasm, slang, and context that confuse a rule-based lexicon."
             )
             fig_cmp = px.scatter(
-                comments_df,
+                adf,
                 x="vader_compound",
                 y="roberta_compound",
                 color="sentiment_label",
@@ -466,11 +493,11 @@ with tab_sent:
 
 # ┌─ Top Fans ───────────────────────────────────────────────────────────────────
 with tab_fans:
-    if comments_df.empty:
-        st.warning("No comments data — cannot identify top fans.")
+    if adf.empty:
+        st.warning("No comments passed the spam/duplicate filter — cannot identify top fans.")
     else:
         st.subheader("Most Active Community Members")
-        top_fans_df = get_top_fans(comments_df, top_n=20)
+        top_fans_df = get_top_fans(adf, top_n=20)
 
         if top_fans_df.empty:
             st.info("Not enough comment data to build a fan leaderboard.")
@@ -579,11 +606,11 @@ with tab_fans:
 
 # ┌─ Trending Topics ─────────────────────────────────────────────────────────────
 with tab_topics:
-    if comments_df.empty:
-        st.warning("No comments data — cannot extract topics.")
+    if adf.empty:
+        st.warning("No comments passed the spam/duplicate filter — cannot extract topics.")
     else:
         st.subheader("What Fans Are Talking About")
-        topics_df = get_trending_topics(comments_df, top_n=30)
+        topics_df = get_trending_topics(adf, top_n=30)
 
         if topics_df.empty:
             st.info("Not enough comment text to extract topics.")
@@ -621,7 +648,7 @@ with tab_topics:
             )
 
             kw_sentiment = keyword_sentiment_breakdown(
-                comments_df, topics_df.head(15)["word"].tolist()
+                adf, topics_df.head(15)["word"].tolist()
             )
 
             if not kw_sentiment.empty:
@@ -732,26 +759,15 @@ with tab_table:
 
         if not comments_df.empty:
             st.subheader("All Comments")
-            comment_display = comments_df[
-                [
-                    "video_id",
-                    "author",
-                    "text",
-                    "sentiment_label",
-                    "sentiment_score",
-                    "like_count",
-                    "published_at",
-                ]
-            ].copy()
-            comment_display.columns = [
-                "Video ID",
-                "Author",
-                "Comment",
-                "Sentiment",
-                "Score",
-                "Likes",
-                "Date",
-            ]
+            st.caption(
+                f"{len(adf):,} used in analytics · "
+                f"{comments_df['is_spam'].sum():,} spam · "
+                f"{comments_df['is_duplicate'].sum():,} near-duplicates"
+            )
+            cols = ["video_id", "author", "text", "is_spam", "is_duplicate",
+                    "language", "sentiment_label", "sentiment_score", "like_count", "published_at"]
+            comment_display = comments_df[[c for c in cols if c in comments_df.columns]].copy()
+            comment_display.columns = [c.replace("_", " ").title() for c in comment_display.columns]
             st.dataframe(comment_display, use_container_width=True, hide_index=True)
             st.download_button(
                 "Download Comments CSV",
