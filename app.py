@@ -1,10 +1,7 @@
-import os
-
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from dotenv import load_dotenv
 
 from src.analytics import (
     aggregate_sentiment_over_time,
@@ -16,7 +13,9 @@ from src.analytics import (
 from src.sentiment import batch_analyze
 from src.youtube_client import YouTubeClient
 
-load_dotenv()
+# ── Config ─────────────────────────────────────────────────────────────────────
+YOUTUBE_API_KEY = "AIzaSyBHCfCa25OzyRfLXSqWZ1IPjRgVAD6DgLg"
+CHANNEL_HANDLE = "jaredmccain024"
 
 st.set_page_config(
     page_title="Fanfare — Jared McCain Fan Intelligence",
@@ -36,40 +35,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ── API key resolution: secrets → env → sidebar input ─────────────────────────
-_default_api_key = (
-    st.secrets.get("YOUTUBE_API_KEY", "")
-    if hasattr(st, "secrets")
-    else os.getenv("YOUTUBE_API_KEY", "")
-)
-
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("Fanfare")
     st.caption("YouTube Fan Intelligence")
     st.divider()
 
-    api_key = st.text_input(
-        "YouTube API Key",
-        value=_default_api_key,
-        type="password",
-        help="From Google Cloud Console → APIs & Services → Credentials",
-    )
-
-    st.markdown("**Channel**")
-    channel_handle = st.text_input(
-        "Handle (e.g. @JaredMcCain)",
-        value="@JaredMcCain",
-        help="YouTube @handle — uses 1 quota unit",
-    )
-    channel_id_input = st.text_input(
-        "— or Channel ID (UCxxxxxxx)",
-        value="",
-        help="Direct ID (starts with UC…). Zero quota cost, takes priority over handle.",
-    )
-
-    st.divider()
-    max_videos = st.slider("Videos to analyze", 5, 100, 50, step=5)
+    max_videos = st.slider("Videos to analyze", 5, 100, 95, step=5)
     max_comments = st.slider("Comments per video", 20, 200, 100, step=20)
 
     quota_estimate = max_videos * 2 + max_videos * (max_comments // 100)
@@ -84,15 +56,12 @@ with st.sidebar:
 # ── Cached data loader ─────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data(
-    api_key: str,
-    handle: str,
-    channel_id: str,
     max_vids: int,
     max_coms: int,
 ) -> tuple[dict | None, pd.DataFrame, pd.DataFrame]:
-    client = YouTubeClient(api_key)
+    client = YouTubeClient(YOUTUBE_API_KEY)
 
-    channel = client.get_channel_info(handle=handle, channel_id=channel_id)
+    channel = client.get_channel_info(handle=CHANNEL_HANDLE)
     if not channel:
         return None, pd.DataFrame(), pd.DataFrame()
 
@@ -121,30 +90,14 @@ st.caption(
     "Engagement, sentiment, and community analysis for marketing & social media leads"
 )
 
-if not api_key:
-    st.info(
-        "Enter your YouTube Data API v3 key in the sidebar, then click **Fetch & Analyze**."
-    )
-    st.stop()
-
 # ── Fetch ──────────────────────────────────────────────────────────────────────
 if fetch_btn:
     with st.spinner(
         f"Fetching up to {max_videos} videos and {max_comments} comments each…"
     ):
-        channel, videos_df, comments_df = load_data(
-            api_key,
-            channel_handle,
-            channel_id_input.strip(),
-            max_videos,
-            max_comments,
-        )
+        channel, videos_df, comments_df = load_data(max_videos, max_comments)
     if channel is None:
-        st.error(
-            f"Channel **{channel_id_input or channel_handle}** not found. "
-            "Check the handle/ID — note that `search.list` is intentionally disabled "
-            "to preserve API quota."
-        )
+        st.error("Could not load channel @jaredmccain024. Check that the API key is valid and the channel is public.")
         st.stop()
 
     st.session_state.update(
@@ -156,7 +109,7 @@ if fetch_btn:
 
 if not st.session_state.get("data_loaded"):
     st.info(
-        "Configure the channel in the sidebar and click **Fetch & Analyze** to begin."
+        "Click **Fetch & Analyze** in the sidebar to begin."
     )
     st.stop()
 
