@@ -137,8 +137,8 @@ def _velocity_action(n: int, title: str, baseline: float) -> str:
     short = title[:55]
     return (
         f'"{short}" has {n:,} total comments vs. a channel baseline of {baseline:.0f}. '
-        "Respond quickly while engagement is hot — pin a comment to guide the "
-        "conversation and consider a follow-up post capitalising on the momentum."
+        "Pin a comment to guide the conversation and consider a follow-up post "
+        "capitalising on the momentum."
     )
 
 
@@ -153,6 +153,24 @@ def _kw_action(delta: float, keyword: str) -> str:
         f'"{keyword}" is driving unusually strong positive engagement. '
         "Lean into it in upcoming content, captions, and titles."
     )
+
+
+# ── Sample comment helper ─────────────────────────────────────────────────────
+
+def _top_comments(df: pd.DataFrame, n: int = 3) -> list[dict]:
+    """Return up to n most-liked comments as plain dicts for embedding in alerts."""
+    if df.empty or "text" not in df.columns:
+        return []
+    cols = [c for c in ("author", "text", "like_count") if c in df.columns]
+    rows = df.nlargest(n, "like_count") if "like_count" in df.columns else df.head(n)
+    out = []
+    for _, r in rows[cols].iterrows():
+        out.append({
+            "author":     str(r.get("author", "fan")),
+            "text":       str(r.get("text", ""))[:280],
+            "like_count": int(r.get("like_count", 0)),
+        })
+    return out
 
 
 # ── Family 1: Sentiment spike ──────────────────────────────────────────────────
@@ -238,6 +256,13 @@ def _sentiment_spike_family(
         if abs(rec["delta"]) < MIN_SENTIMENT_DELTA:
             continue
         action = _sent_action(rec["delta"], rec["title"])
+        # Pull the most-liked comments from this video that drove the signal.
+        # For negative spikes use the lowest-scoring comments; for positive use highest.
+        vid_certain = certain[certain["video_id"] == rec["video_id"]]
+        if rec["delta"] < 0:
+            sample_rows = vid_certain.nsmallest(3, "sentiment_score")
+        else:
+            sample_rows = vid_certain.nlargest(3, "like_count")
         alerts.append({
             "family":              "sentiment_spike",
             "title":               f"Sentiment {'drop' if rec['delta'] < 0 else 'spike'}: \"{rec['title'][:55]}\"",
@@ -252,6 +277,7 @@ def _sentiment_spike_family(
             "direction":           "negative" if rec["delta"] < 0 else "positive",
             "action":              action,
             "severity":            "warning" if rec["delta"] < 0 else "info",
+            "sample_comments":     _top_comments(sample_rows),
         })
 
     return alerts, meta
@@ -337,6 +363,11 @@ def _velocity_anomaly_family(
         n = int(getattr(vid_row, "comment_count", 0))
         title = vid_title.get(vid, vid)
         action = _velocity_action(n, title, mu)
+        vid_comments = (
+            comments_df[comments_df["video_id"] == vid]
+            if not comments_df.empty and "video_id" in comments_df.columns
+            else pd.DataFrame()
+        )
         alerts.append({
             "family":              "velocity_anomaly",
             "title":               f"Comment surge: \"{title[:55]}\"",
@@ -351,6 +382,7 @@ def _velocity_anomaly_family(
             "direction":           "high" if z_val > 0 else "low",
             "action":              action,
             "severity":            "info",
+            "sample_comments":     _top_comments(vid_comments),
         })
 
     return alerts, meta
@@ -408,6 +440,7 @@ def _keyword_shift_family(
             "n": len(scores),
             "delta": round(delta, 4),
             "p_raw": p_val,
+            "subset": subset,   # kept for sample comment extraction below
         })
 
     m = len(records)
@@ -441,6 +474,12 @@ def _keyword_shift_family(
         if abs(rec["delta"]) < MIN_SENTIMENT_DELTA:
             continue
         action = _kw_action(rec["delta"], rec["keyword"])
+        subset = rec["subset"]
+        # For negative keywords show the most critical; positive show most endorsed
+        if rec["delta"] < 0:
+            sample_rows = subset.nsmallest(3, "sentiment_score")
+        else:
+            sample_rows = subset.nlargest(3, "like_count")
         alerts.append({
             "family":              "keyword_shift",
             "title":               f"Keyword signal: \"{rec['keyword']}\"",
@@ -455,6 +494,7 @@ def _keyword_shift_family(
             "direction":           "negative" if rec["delta"] < 0 else "positive",
             "action":              action,
             "severity":            "warning" if rec["delta"] < -0.10 else "info",
+            "sample_comments":     _top_comments(sample_rows),
         })
 
     return alerts, meta
@@ -511,5 +551,6 @@ def run_alerts(
             "velocity_anomaly": vel_meta,
             "keyword_shift":    kw_meta,
         },
-        "correction": correction,
+        "correction":  correction,
+        "fetched_at":  pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
     }

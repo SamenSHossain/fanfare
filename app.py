@@ -267,20 +267,24 @@ def _build_insights(
 
     if not videos_df.empty:
         top_video = videos_df.loc[videos_df["view_count"].idxmax()]
+        _tv_url = f"https://youtube.com/watch?v={top_video['video_id']}"
+        _tv_title = top_video['title'][:55] + ('…' if len(top_video['title']) > 55 else '')
         insights.append({
             "color": "blue",
             "icon": "🎬",
-            "title": f"Most viral: \"{top_video['title'][:55]}{'…' if len(top_video['title'])>55 else ''}\" — {top_video['view_count']:,} views",
+            "title": f"Most viral: [{_tv_title}]({_tv_url}) — {top_video['view_count']:,} views",
             "action": f"Engagement rate: {top_video['engagement_rate']:.2f}%. Identify what made this video pop and replicate the format.",
         })
 
         avg_er = videos_df["engagement_rate"].mean()
         best_er = videos_df.loc[videos_df["engagement_rate"].idxmax()]
         if best_er["video_id"] != top_video["video_id"]:
+            _be_url = f"https://youtube.com/watch?v={best_er['video_id']}"
+            _be_title = best_er['title'][:50] + ('…' if len(best_er['title']) > 50 else '')
             insights.append({
                 "color": "violet",
                 "icon": "📈",
-                "title": f"Highest engagement: \"{best_er['title'][:50]}{'…' if len(best_er['title'])>50 else ''}\" — {best_er['engagement_rate']:.2f}%",
+                "title": f"Highest engagement: [{_be_title}]({_be_url}) — {best_er['engagement_rate']:.2f}%",
                 "action": f"Channel avg is {avg_er:.2f}%. This video drove outsized fan interaction — study its hook, length, and topic.",
             })
 
@@ -288,10 +292,15 @@ def _build_insights(
         top_fans = get_top_fans(comments_df, top_n=5)
         if not top_fans.empty:
             top_fan = top_fans.iloc[0]
+            _fan_cid = top_fan.get("author_channel_id", "")
+            _fan_link = (
+                f"[{top_fan['author']}](https://youtube.com/channel/{_fan_cid})"
+                if _fan_cid else top_fan['author']
+            )
             insights.append({
                 "color": "orange",
                 "icon": "⭐",
-                "title": f"Super fan: {top_fan['author']} — {int(top_fan['comment_count'])} comments across {int(top_fan['videos_commented'])} videos",
+                "title": f"Super fan: {_fan_link} — {int(top_fan['comment_count'])} comments across {int(top_fan['videos_commented'])} videos",
                 "action": "Consider a shout-out, early access, or DM to convert this fan into an ambassador.",
             })
 
@@ -353,10 +362,11 @@ with tab_alerts:
         _a_families = alerts_result.get("families", {})
         _a_method   = alerts_result.get("correction", CORRECTION_METHOD)
 
-        _tested  = _a_summary.get("tested", 0)
-        _passed  = _a_summary.get("passed", 0)
-        _naive   = _a_summary.get("naive_count", 0)
-        _blocked = _naive - _passed
+        _tested    = _a_summary.get("tested", 0)
+        _passed    = _a_summary.get("passed", 0)
+        _naive     = _a_summary.get("naive_count", 0)
+        _blocked   = _naive - _passed
+        _fetched   = alerts_result.get("fetched_at", "")
 
         # ── Summary banner ───────────────────────────────────────────────────
         st.markdown(
@@ -364,6 +374,7 @@ with tab_alerts:
             f"{_passed} passed {_a_method.upper()} correction**"
             + (f" · {_blocked} suppressed vs. naïve α=0.05" if _blocked > 0 else
                " · same count as naïve α=0.05 (no inflation detected)")
+            + (f"  \n_Data pulled: {_fetched}_" if _fetched else "")
         )
 
         # Per-family breakdown
@@ -412,6 +423,29 @@ with tab_alerts:
                         else:
                             st.info(f"**Recommended action:** {alert['action']}")
 
+                        # YouTube link — takes the lead directly to the content
+                        _vid_id = alert.get("video_id")
+                        if _vid_id:
+                            st.link_button(
+                                "▶ Open video on YouTube",
+                                f"https://youtube.com/watch?v={_vid_id}",
+                            )
+
+                        # Sample comments that triggered the alert
+                        _samples = alert.get("sample_comments", [])
+                        if _samples:
+                            st.markdown(
+                                "**Comments that drove this signal:**"
+                                if fam != "keyword_shift"
+                                else "**Representative comments mentioning this keyword:**"
+                            )
+                            for sc in _samples:
+                                likes_str = f" · {sc['like_count']} likes" if sc["like_count"] else ""
+                                st.markdown(
+                                    f"> {sc['text']}  \n"
+                                    f"> — **{sc['author']}**{likes_str}"
+                                )
+
                     with right:
                         st.markdown(f"**What changed:** {alert['magnitude_label']}")
                         st.markdown(f"**Sample size (n):** {alert['n']:,} comments")
@@ -422,7 +456,6 @@ with tab_alerts:
                         thresh = alert.get("corrected_threshold")
 
                         if fam == "velocity_anomaly":
-                            # z-score family: no formal p-value
                             st.markdown(
                                 f"**Corrected threshold cleared:** {thresh}  \n"
                                 f"**Normal-approx p (reference only):** {raw_p:.5f}"
@@ -1043,17 +1076,37 @@ with tab_fans:
 
         # ── Fan lookup table ─────────────────────────────────────────────────
         st.subheader("Fan Lookup")
-        st.caption("Full table — sort any column, search by name in your browser")
+        st.caption("Full table — sort any column · channel link opens their YouTube page")
         _display_fans = _fans_df[[
+            "author", "author_channel_id", "cluster_label", "comment_count",
+            "videos_commented", "avg_sentiment", "likes_earned", "recency", "consistency",
+        ]].copy() if "author_channel_id" in _fans_df.columns else _fans_df[[
             "author", "cluster_label", "comment_count", "videos_commented",
             "avg_sentiment", "likes_earned", "recency", "consistency",
         ]].copy()
-        _display_fans.columns = [
-            "Fan", "Segment", "Comments", "Videos",
-            "Avg Sentiment", "Likes Earned", "Days Since Last", "Weeks Active",
-        ]
+
+        if "author_channel_id" in _display_fans.columns:
+            _display_fans["channel"] = (
+                "https://youtube.com/channel/" + _display_fans["author_channel_id"].fillna("")
+            )
+            _display_fans = _display_fans.drop(columns=["author_channel_id"])
+            _display_fans.columns = [
+                "Fan", "Segment", "Comments", "Videos",
+                "Avg Sentiment", "Likes Earned", "Days Since Last", "Weeks Active", "Channel",
+            ]
+            _col_cfg = {
+                "Channel": st.column_config.LinkColumn("Channel", display_text="↗ View"),
+            }
+        else:
+            _display_fans.columns = [
+                "Fan", "Segment", "Comments", "Videos",
+                "Avg Sentiment", "Likes Earned", "Days Since Last", "Weeks Active",
+            ]
+            _col_cfg = {}
+
         _display_fans = _display_fans.sort_values("Comments", ascending=False).reset_index(drop=True)
-        st.dataframe(_display_fans, use_container_width=True, hide_index=True)
+        st.dataframe(_display_fans, use_container_width=True, hide_index=True,
+                     column_config=_col_cfg)
 
 
 # ┌─ Trending Topics ─────────────────────────────────────────────────────────────
@@ -1200,6 +1253,7 @@ with tab_table:
 
         display_df = videos_df[
             [
+                "video_id",
                 "title",
                 "published_at",
                 "view_count",
@@ -1209,11 +1263,12 @@ with tab_table:
                 "duration_secs",
             ]
         ].copy()
+        display_df["watch"] = "https://youtube.com/watch?v=" + display_df["video_id"]
         display_df["published_at"] = display_df["published_at"].dt.strftime("%Y-%m-%d")
         display_df["duration"] = display_df["duration_secs"].apply(
             lambda s: f"{s // 60}m {s % 60}s" if s else "N/A"
         )
-        display_df = display_df.drop(columns=["duration_secs"])
+        display_df = display_df.drop(columns=["duration_secs", "video_id"])
         display_df.columns = [
             "Title",
             "Published",
@@ -1222,6 +1277,7 @@ with tab_table:
             "Comments",
             "Engagement %",
             "Duration",
+            "Watch",
         ]
 
         st.dataframe(
@@ -1229,16 +1285,17 @@ with tab_table:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Views": st.column_config.NumberColumn(format="%d"),
-                "Likes": st.column_config.NumberColumn(format="%d"),
-                "Comments": st.column_config.NumberColumn(format="%d"),
+                "Views":        st.column_config.NumberColumn(format="%d"),
+                "Likes":        st.column_config.NumberColumn(format="%d"),
+                "Comments":     st.column_config.NumberColumn(format="%d"),
                 "Engagement %": st.column_config.NumberColumn(format="%.2f%%"),
+                "Watch":        st.column_config.LinkColumn("Watch", display_text="▶ Watch"),
             },
         )
 
         st.download_button(
             "Download Videos CSV",
-            display_df.to_csv(index=False),
+            display_df.drop(columns=["Watch"]).to_csv(index=False),
             file_name="jared_mccain_videos.csv",
             mime="text/csv",
         )
