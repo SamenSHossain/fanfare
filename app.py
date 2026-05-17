@@ -1061,15 +1061,15 @@ with tab_alerts:
                         st.markdown(f"**What changed:** {alert['magnitude_label']}")
                         st.markdown(f"**Sample size:** {alert['n']:,} comments")
 
-                        with st.expander("Statistical details"):
-                            method = alert.get("correction_method", _a_method)
-                            raw_p  = alert.get("p_raw")
-                            adj_p  = alert.get("p_adj")
-                            thresh = alert.get("corrected_threshold")
-                            if fam == "velocity_anomaly":
-                                st.markdown(f"**Corrected threshold cleared:** {thresh}  \n**Normal-approx p (reference only):** {raw_p:.5f}")
-                            else:
-                                st.markdown(f"**Raw p-value:** {raw_p:.5f}  \n**Adjusted p ({method}):** {adj_p:.5f}  \n**Corrected threshold:** {thresh:.5f}")
+                        st.divider()
+                        method = alert.get("correction_method", _a_method)
+                        raw_p  = alert.get("p_raw")
+                        adj_p  = alert.get("p_adj")
+                        thresh = alert.get("corrected_threshold")
+                        if fam == "velocity_anomaly":
+                            st.caption(f"Corrected threshold: {thresh}  \nNormal-approx p (ref): {raw_p:.5f}")
+                        else:
+                            st.caption(f"Raw p: {raw_p:.5f} · Adj p ({method}): {adj_p:.5f} · Threshold: {thresh:.5f}")
 
         with st.expander("Methodology — how correction works"):
             st.markdown(
