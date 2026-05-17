@@ -235,6 +235,33 @@ def _score_all_vader(records: list[dict], text_col: str) -> list[dict]:
     return out
 
 
+import re as _re
+
+_SARCASM_RE = _re.compile(
+    r"\byeah right\b"
+    r"|\bnot\s+\w+\s+(good|great|amazing|best|elite|special|incredible)\b"
+    r"|\boverrated+d*\b"
+    r"|\blmao\b|\blmfao\b"
+    r"|💀|🙄"
+    r"|\bsooo+\s+(good|great|amazing|elite)\b",
+    _re.IGNORECASE,
+)
+
+
+def count_likely_sarcastic(texts) -> int:
+    """
+    Count comments matching at least one sarcasm-signal pattern.
+    Accepts a pandas Series or any iterable of strings.
+    These patterns flag obvious signals only — the count is a lower bound.
+    """
+    try:
+        import pandas as _pd
+        s = texts if isinstance(texts, _pd.Series) else _pd.Series(list(texts))
+        return int(s.astype(str).str.contains(_SARCASM_RE, regex=True, na=False).sum())
+    except Exception:
+        return sum(1 for t in texts if _SARCASM_RE.search(str(t)))
+
+
 def score_comments(
     records: list[dict],
     already_scored_ids: set[str] | None = None,

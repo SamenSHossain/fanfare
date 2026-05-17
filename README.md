@@ -2,70 +2,166 @@
 
 YouTube fan intelligence dashboard for **Jared McCain** — built for marketing and social media leads who need to understand and act on fan activity without wading through raw data.
 
-## Demo
+---
 
-> Deploy to [Streamlit Community Cloud](https://share.streamlit.io) and paste the link here.
+## Quick start (no setup required)
 
-## Features
-
-| Tab | What you get |
-|-----|-------------|
-| **Key Insights** | Auto-generated action items: top sentiment signal, most viral video, super fan to engage, hottest keyword |
-| **📊 Engagement** | Views/likes/comments per video over time, top-10 by views, engagement rate scatter |
-| **💬 Sentiment** | Positive/Neutral/Negative breakdown, sentiment gauge, trend line across videos, sample best and worst comments |
-| **🏆 Top Fans** | Leaderboard ranked by comment volume + sentiment; Super Fan callouts for ambassador/giveaway targeting |
-| **🔥 Trending Topics** | Top 30 keywords, keyword × sentiment scatter, action table flagging what to amplify vs. monitor |
-| **📋 All Videos** | Sortable full dataset with CSV export for videos and comments |
-
-## Setup
-
-**Prerequisites:** Python 3.10+, a [YouTube Data API v3 key](https://console.cloud.google.com) (free, no credit card)
+The API key and channel are pre-configured. Clone the repo, install dependencies, and run:
 
 ```bash
 git clone https://github.com/SamenSHossain/fanfare.git
 cd fanfare
 pip install -r requirements.txt
-cp .env.example .env        # paste your API key into .env
 streamlit run app.py
 ```
 
-The app reads your key from `.env` automatically. You can also enter it directly in the sidebar at runtime.
+Open **http://localhost:8501**, click **Refresh Data** in the sidebar, and wait ~60–90 seconds for the full pipeline to run.
 
-## Testing Instructions
+### Credentials for testing
 
-1. Run the app with `streamlit run app.py`
-2. Enter a YouTube API v3 key in the sidebar (or set `YOUTUBE_API_KEY` in `.env`)
-3. Leave the channel set to `@JaredMcCain` (default) and click **Fetch & Analyze**
-4. Adjust the **Videos** and **Comments per video** sliders to control how much data is pulled
-5. Explore each tab — the Key Insights panel at the top gives the fastest summary
+| What | Value |
+|------|-------|
+| YouTube API key | `AIzaSyBHCfCa25OzyRfLXSqWZ1IPjRgVAD6DgLg` |
+| Channel | `@jaredmccain024` (Jared McCain, NBA guard) |
+| Daily API quota | 10,000 units free — a full run costs ~100 units |
 
-**Quota note:** The app uses only `channels.list` (1 unit), `playlistItems.list` (1 unit/page), `videos.list` (1 unit/50 videos), and `commentThreads.list` (1 unit/page). `search.list` (100 units/call) is intentionally disabled. A typical run of 20 videos × 100 comments costs roughly 60–80 units out of the 10,000 free daily quota.
+Both are hardcoded in `app.py` — no `.env` file or secrets needed to run the demo.
 
-## Deploying to Streamlit Community Cloud
+---
 
-1. Fork or push this repo to GitHub
-2. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**
-3. Select `SamenSHossain/fanfare`, set entrypoint to `app.py`
-4. Under **Advanced settings → Secrets**, add:
-   ```toml
-   YOUTUBE_API_KEY = "your_key_here"
-   ```
-5. Click **Deploy** — you'll get a public `*.streamlit.app` URL
+## Walkthrough
 
-## Roadmap
+### Sidebar
 
-With more time, the highest-value additions would be:
+- **Date range** — filters all charts and metrics to videos published in the last 7, 28, or 90 days, or shows all time. Start with **Last 28 days** for a representative view.
+- **Refresh Data** — fetches from the YouTube API and runs the full analysis pipeline (sentiment, topics, fan segments, alerts). Takes ~60–90 seconds. Results are cached for 1 hour.
+- **Advanced** — exposes the raw API fetch parameters (videos to fetch, comments per video). Leave at defaults unless you want to reduce quota usage or get a faster preview.
+- **Last updated** — shows the timestamp of the most recent fetch.
 
-- **Cross-channel benchmarking** — pull two or three comparable athletes and overlay their engagement rates and sentiment scores so the marketing lead has context ("McCain's 5.2% engagement rate vs. league average of 3.1%")
-- **Comment reply suggestions** — pipe the top positive/critical comments through an LLM to draft reply copy, saving the social team time on the hardest part of community management
-- **Scheduled digests** — a weekly email or Slack message with the Key Insights delta (what changed since last week), so the lead doesn't need to open the dashboard to stay informed
-- **Shorts vs. long-form split** — separate the engagement analytics by video type, since Shorts and long-form drive very different comment behaviors and audience segments
-- **Keyword alerts** — let the user pin specific keywords (e.g. a sponsor name, a controversy term) and get notified when mention volume spikes
+### Tab: Overview
+
+The landing tab. Shows:
+
+1. **Active alerts** at the top — any statistically significant signals that cleared multiple-comparisons correction. Each shows magnitude and a direct YouTube link. See the Alerts tab for full detail.
+2. **Key insights** — auto-generated action cards: top sentiment signal, most viral video, highest-engagement video, super fan to engage, top keyword sentiment. All links are clickable.
+
+### Tab: Engagement
+
+Video performance charts filtered to the selected date range:
+
+- Views per video over time (color = engagement rate)
+- Top 10 videos by views
+- Views vs. Likes scatter (bubble size = comment volume)
+- Summary row: avg views, likes, comments, engagement rate per video
+
+### Tab: Sentiment
+
+Fan comment sentiment analysis. Read the **yellow info box at the top** before interpreting numbers — it explains what the model can and cannot detect (target attribution, sarcasm).
+
+- **5 metrics row** — Positive / Neutral / Negative / Uncertain / Likely Sarcastic counts with percentages
+- **Distribution pie** + **% summary** — headline Positive% with delta vs. Negative%; Like-Weighted and Flat Mean scores; Endorsed Gap signal
+- **Sentiment trend** — like-weighted sentiment per video over time, with flat mean overlay
+- **Emotion breakdown** — 7-class emotion distribution (joy, anger, sadness, etc.)
+- **Video Deep Dive** — pick any video from the dropdown to see its own sentiment and emotion breakdown, plus sample comments by emotion
+- **Sample Comments** — most positive, most critical, and uncertain examples
+
+**Interpreting the numbers:**
+- Positive% is of *confident* comments only (Uncertain excluded — see `UNCERTAIN_THRESHOLD = 0.55` in `src/scoring.py`)
+- Like-Weighted score weights each comment's sentiment by `log(1 + likes)` so highly-endorsed comments carry more weight
+- The Gap signal fires when liked comments systematically diverge from the average
+
+### Tab: Top Fans
+
+k-means fan segmentation (k selected by silhouette score) across 6 features: comment count, videos commented, average sentiment, likes earned, recency, comment consistency.
+
+- **Segment cards** — each cluster shows its label, size, recommended action, and centroid profile (z-scores vs. average fan)
+- **Fan Map** — scatter of all fans colored by segment (activity × sentiment, bubble = likes)
+- **Fan Lookup** — full sortable table with YouTube channel links
+
+### Tab: Trending Topics
+
+BERTopic semantic clustering of all clean comments (all-MiniLM-L6-v2 embeddings, TruncatedSVD, KeyBERTInspired labels).
+
+- **Prominence bar chart** — topics ranked by Σ log(1 + likes), colored by sentiment signal
+- **Sentiment scatter** — prominence vs. like-weighted sentiment for topics with ≥ 20 confident comments
+- **Topic cards** — per-topic: action signal, comment count, sample comments
+
+### Tab: All Videos
+
+Full video table (all fetched videos, regardless of date range filter) with ▶ Watch links and CSV export. Below it: **Comment Explorer** with sentiment/emotion filters and a "Show technical columns" toggle for probability scores.
+
+### Tab: Alerts
+
+Statistically corrected signals across three families:
+
+| Family | Method | What it tests |
+|--------|--------|---------------|
+| Sentiment spike | One-sample t-test per video vs. channel mean | Bonferroni/BH corrected |
+| Velocity anomaly | Z-score of comment count vs. channel distribution | Corrected sigma cutoff |
+| Keyword shift | One-sample t-test per top keyword vs. channel mean | Bonferroni/BH corrected |
+
+Each alert shows: recommended action, YouTube link, sample comments that drove the signal. Statistical details (p-values, adjusted threshold) are collapsed behind **Statistical details** — the marketing lead doesn't need them.
+
+The methodology expander at the bottom explains Bonferroni vs. BH, the sample guard, and the effect-size gate.
+
+---
+
+## Pipeline architecture
+
+```
+YouTube API
+    └── YouTubeClient (src/youtube_client.py)
+            ├── get_channel_info      1 quota unit
+            ├── get_video_ids         1 unit/page (50 videos/page)
+            ├── get_video_details     1 unit/batch of 50
+            └── get_all_comments      1 unit/page (100 comments/page)
+
+clean_comments (src/cleaning.py)
+    └── spam filter, dedup, language detection, text normalization
+
+score_comments (src/scoring.py)
+    ├── cardiffnlp/twitter-roberta-base-sentiment-latest  (EN)
+    ├── cardiffnlp/twitter-xlm-roberta-base-sentiment     (non-EN)
+    └── j-hartmann/emotion-english-distilroberta-base     (all)
+
+run_topic_model (src/topics.py)
+    └── BERTopic + all-MiniLM-L6-v2 + TruncatedSVD + KeyBERTInspired
+
+run_fan_segmentation (src/fans.py)
+    └── k-means, k selected by silhouette score
+
+run_alerts (src/alerts.py)
+    └── three families, Bonferroni correction by default
+```
+
+All five stages run inside `@st.cache_data(ttl=3600)` — results are in-memory for one hour and recomputed on Refresh.
+
+---
+
+## Quota usage
+
+A full run at defaults (95 videos, 100 comments/video):
+
+| Call | Units |
+|------|-------|
+| `channels.list` | 1 |
+| `playlistItems.list` (~2 pages) | 2 |
+| `videos.list` (~2 batches of 50) | 2 |
+| `commentThreads.list` (~95 pages) | 95 |
+| **Total** | **~100** |
+
+`search.list` (100 units/call) is intentionally never used.
+
+---
 
 ## Stack
 
-- [YouTube Data API v3](https://developers.google.com/youtube/v3) — channel, video, and comment data
-- [VADER Sentiment](https://github.com/cjhutto/vaderSentiment) — social-media-tuned sentiment analysis, no API key required
+- [YouTube Data API v3](https://developers.google.com/youtube/v3)
+- [cardiffnlp/twitter-roberta-base-sentiment-latest](https://huggingface.co/cardiffnlp/twitter-roberta-base-sentiment-latest) — sentiment
+- [j-hartmann/emotion-english-distilroberta-base](https://huggingface.co/j-hartmann/emotion-english-distilroberta-base) — emotion
+- [BERTopic](https://maartengr.github.io/BERTopic/) — topic modeling
+- [sentence-transformers/all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) — embeddings
 - [Streamlit](https://streamlit.io) — dashboard framework
-- [Plotly](https://plotly.com/python/) — interactive charts
-- [pandas](https://pandas.pydata.org) — data processing
+- [Plotly](https://plotly.com/python/) — charts
+- [scikit-learn](https://scikit-learn.org) — k-means, TruncatedSVD, silhouette
+- [scipy](https://scipy.org) — t-tests, normal distribution for alert correction

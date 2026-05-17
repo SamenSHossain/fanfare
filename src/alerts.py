@@ -123,8 +123,9 @@ def _sent_action(delta: float, title: str) -> str:
     if delta < 0:
         return (
             f'Sentiment for "{short}" is significantly below the channel average. '
-            "Review the most critical comments on this video, identify the recurring "
-            "concern, and address it in a community post or follow-up video."
+            "Read the sample comments to determine whether this reflects channel "
+            "feedback or reactions to players, referees, or match outcomes — "
+            "then decide whether a response or follow-up is warranted."
         )
     return (
         f'Sentiment for "{short}" is significantly above the channel average. '
