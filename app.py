@@ -4,19 +4,33 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.analytics import (
+    SENTIMENT_GAP_THRESHOLD,
     aggregate_sentiment_over_time,
     compute_engagement_rate,
     get_top_fans,
     get_trending_topics,
     keyword_sentiment_breakdown,
+    weighted_mean_sentiment,
 )
 from src.cleaning import clean_comments
-from src.sentiment import batch_analyze
+from src.fans import FEATURE_DISPLAY, run_fan_segmentation
+from src.scoring import EMOTION_LABELS, UNCERTAIN_THRESHOLD, score_comments
+from src.topics import run_topic_model
 from src.youtube_client import YouTubeClient
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 YOUTUBE_API_KEY = "AIzaSyBHCfCa25OzyRfLXSqWZ1IPjRgVAD6DgLg"
 CHANNEL_HANDLE = "jaredmccain024"
+
+EMOTION_COLORS: dict[str, str] = {
+    "joy":      "#F1C40F",
+    "sadness":  "#3498DB",
+    "anger":    "#E74C3C",
+    "fear":     "#E67E22",
+    "disgust":  "#8E44AD",
+    "surprise": "#1ABC9C",
+    "neutral":  "#95A5A6",
+}
 
 st.set_page_config(
     page_title="Fanfare — Jared McCain Fan Intelligence",
@@ -59,16 +73,16 @@ with st.sidebar:
 def load_data(
     max_vids: int,
     max_coms: int,
-) -> tuple[dict | None, pd.DataFrame, pd.DataFrame]:
+) -> tuple[dict | None, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
     client = YouTubeClient(YOUTUBE_API_KEY)
 
     channel = client.get_channel_info(handle=CHANNEL_HANDLE)
     if not channel:
-        return None, pd.DataFrame(), pd.DataFrame()
+        return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}
 
     video_ids = client.get_video_ids(channel["uploads_playlist_id"], max_vids)
     if not video_ids:
-        return channel, pd.DataFrame(), pd.DataFrame()
+        return channel, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}
 
     videos_df = client.get_video_details(video_ids)
     if not videos_df.empty:
@@ -80,23 +94,46 @@ def load_data(
 
     raw_df = client.get_all_comments(video_ids, max_coms)
     if raw_df.empty:
-        return channel, videos_df, pd.DataFrame()
+        return channel, videos_df, pd.DataFrame(), pd.DataFrame(), {}
 
     # Stage 1: clean — adds cleaned_text, is_spam, language, is_duplicate
     records = clean_comments(raw_df.to_dict("records"))
     comments_df = pd.DataFrame(records)
 
-    # Stage 2: sentiment on clean subset only, using cleaned_text
+    # Stage 2: sentiment + emotion on clean subset only, using cleaned_text
     clean_mask = ~comments_df["is_spam"] & ~comments_df["is_duplicate"]
     if clean_mask.any():
-        clean_subset = batch_analyze(
-            comments_df[clean_mask].copy(), text_col="cleaned_text"
-        )
-        # Write new columns back to full DataFrame; spam/dupe rows get NaN
-        for col in [c for c in clean_subset.columns if c not in comments_df.columns]:
-            comments_df[col] = clean_subset[col]
+        clean_records = comments_df[clean_mask].to_dict("records")
+        scored = score_comments(clean_records, text_col="cleaned_text")
+        scored_df = pd.DataFrame(scored)
+        score_cols = [
+            "sentiment_label", "neg_prob", "neu_prob", "pos_prob", "sentiment_score",
+            "emotion",
+            *[f"emotion_{e}" for e in EMOTION_LABELS],
+        ]
+        for col in score_cols:
+            if col in scored_df.columns:
+                comments_df.loc[clean_mask, col] = scored_df[col].values
 
-    return channel, videos_df, comments_df
+    # Shared clean+scored slice reused by Stage 3 and Stage 4
+    clean_comments_df = comments_df[clean_mask].reset_index(drop=True) if clean_mask.any() else pd.DataFrame()
+
+    # Stage 3: semantic topic modeling on clean, scored comments
+    # Runs after sentiment so topic stats include sentiment_label / sentiment_score.
+    # Embeddings are computed fresh here (all-MiniLM-L6-v2); pass them via the
+    # embeddings= parameter if a future step already produces sentence vectors.
+    topics_df = pd.DataFrame()
+    if not clean_comments_df.empty:
+        topics_df, _ = run_topic_model(clean_comments_df)
+
+    # Stage 4: fan segmentation — k-means on per-commenter feature matrix.
+    # Runs in ingestion so Streamlit reads precomputed cluster assignments;
+    # no clustering happens on page load.
+    fan_segments: dict = {}
+    if not clean_comments_df.empty:
+        fan_segments = run_fan_segmentation(clean_comments_df)
+
+    return channel, videos_df, comments_df, topics_df, fan_segments
 
 
 # ── Page header ────────────────────────────────────────────────────────────────
@@ -110,7 +147,7 @@ if fetch_btn:
     with st.spinner(
         f"Fetching up to {max_videos} videos and {max_comments} comments each…"
     ):
-        channel, videos_df, comments_df = load_data(max_videos, max_comments)
+        channel, videos_df, comments_df, topics_df, fan_segments = load_data(max_videos, max_comments)
     if channel is None:
         st.error("Could not load channel @jaredmccain024. Check that the API key is valid and the channel is public.")
         st.stop()
@@ -119,6 +156,8 @@ if fetch_btn:
         channel=channel,
         videos_df=videos_df,
         comments_df=comments_df,
+        topics_df=topics_df,
+        fan_segments=fan_segments,
         data_loaded=True,
     )
 
@@ -131,15 +170,26 @@ if not st.session_state.get("data_loaded"):
 channel: dict = st.session_state.channel
 videos_df: pd.DataFrame = st.session_state.videos_df
 comments_df: pd.DataFrame = st.session_state.comments_df
+topics_df: pd.DataFrame = st.session_state.get("topics_df", pd.DataFrame())
+fan_segments: dict = st.session_state.get("fan_segments", {})
 
-# Filtered view used by all analytics — excludes spam and near-duplicates.
-# comments_df (full) is kept for audit display in the All Videos tab.
+# adf: all clean (non-spam, non-duplicate), scored comments — includes Uncertain.
+#      Used for counts, topic models, fan activity, and the raw comment table.
+# cdf: "confident" subset of adf — Uncertain labels excluded.
+#      Used for any metric that involves averaging sentiment scores so that
+#      comments where the model cannot confidently assign a class do not
+#      compress the signal toward zero (fake-neutral problem).
 adf: pd.DataFrame = (
     comments_df[~comments_df["is_spam"] & ~comments_df["is_duplicate"]].dropna(
         subset=["sentiment_score"]
     )
     if not comments_df.empty and "is_spam" in comments_df.columns
     else comments_df
+)
+cdf: pd.DataFrame = (
+    adf[adf["sentiment_label"] != "Uncertain"]
+    if not adf.empty and "sentiment_label" in adf.columns
+    else adf
 )
 
 # ── Channel hero ───────────────────────────────────────────────────────────────
@@ -175,10 +225,18 @@ def _build_insights(
 ) -> list[dict]:
     insights = []
 
-    if not comments_df.empty and "sentiment_label" in comments_df.columns:
-        pos_pct = (comments_df["sentiment_label"] == "Positive").mean() * 100
-        neg_pct = (comments_df["sentiment_label"] == "Negative").mean() * 100
-        avg_score = comments_df["sentiment_score"].mean()
+    # Sentiment stats exclude Uncertain so the average reflects only comments
+    # the model could confidently classify (see UNCERTAIN_THRESHOLD rationale)
+    certain = (
+        comments_df[comments_df["sentiment_label"] != "Uncertain"]
+        if not comments_df.empty and "sentiment_label" in comments_df.columns
+        else comments_df
+    )
+
+    if not certain.empty and "sentiment_label" in certain.columns:
+        pos_pct = (certain["sentiment_label"] == "Positive").mean() * 100
+        neg_pct = (certain["sentiment_label"] == "Negative").mean() * 100
+        avg_score = certain["sentiment_score"].mean()
         sentiment_color = "green" if avg_score >= 0.05 else ("red" if avg_score <= -0.05 else "orange")
         insights.append({
             "color": sentiment_color,
@@ -339,39 +397,66 @@ with tab_sent:
     else:
         st.subheader("Fan Comment Sentiment")
 
-        counts = adf["sentiment_label"].value_counts()
-        avg_score = adf["sentiment_score"].mean()
+        # ── 4-state counts ──────────────────────────────────────────────────────
+        _label_counts = adf["sentiment_label"].value_counts()
+        _total = len(adf)
+        _pos_n   = int(_label_counts.get("Positive",  0))
+        _neu_n   = int(_label_counts.get("Neutral",   0))
+        _neg_n   = int(_label_counts.get("Negative",  0))
+        _unc_n   = int(_label_counts.get("Uncertain", 0))
+
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        sc1.metric("Positive",  f"{_pos_n:,}",  f"{_pos_n/_total*100:.1f}%")
+        sc2.metric("Neutral",   f"{_neu_n:,}",  f"{_neu_n/_total*100:.1f}%")
+        sc3.metric("Negative",  f"{_neg_n:,}",  f"{_neg_n/_total*100:.1f}%")
+        sc4.metric("Uncertain", f"{_unc_n:,}",  f"{_unc_n/_total*100:.1f}%")
+
+        if _unc_n:
+            st.info(
+                f"**{_unc_n:,} comments ({_unc_n/_total*100:.1f}%) have uncertain sentiment** — "
+                f"the model's max class probability was below {UNCERTAIN_THRESHOLD:.0%}. "
+                "These are excluded from the average score and trend line (see scoring.py for rationale)."
+            )
+
+        # ── Pie + Gauge ─────────────────────────────────────────────────────────
+        # Both metrics use cdf (certain comments only — uncertain excluded).
+        # Gauge primary = like-weighted mean; flat mean shown as secondary.
+        weighted_score, flat_score = weighted_mean_sentiment(cdf) if not cdf.empty else (0.0, 0.0)
+        gap = round(weighted_score - flat_score, 4)
 
         col_pie, col_gauge = st.columns(2)
 
         with col_pie:
             fig_pie = px.pie(
-                values=counts.values,
-                names=counts.index,
-                color=counts.index,
+                values=_label_counts.values,
+                names=_label_counts.index,
+                color=_label_counts.index,
                 color_discrete_map={
-                    "Positive": "#27AE60",
-                    "Neutral": "#95A5A6",
-                    "Negative": "#E74C3C",
+                    "Positive":  "#27AE60",
+                    "Neutral":   "#95A5A6",
+                    "Negative":  "#E74C3C",
+                    "Uncertain": "#9B59B6",
                 },
                 hole=0.45,
-                title="Overall Sentiment Distribution",
+                title="Overall Sentiment Distribution (all scored comments)",
             )
             fig_pie.update_traces(
-                textinfo="percent+label", textfont_size=14, pull=[0.03, 0, 0]
+                textinfo="percent+label",
+                textfont_size=13,
+                pull=[0.08 if n == "Uncertain" else 0 for n in _label_counts.index],
             )
             st.plotly_chart(fig_pie, use_container_width=True)
 
         with col_gauge:
             bar_color = (
                 "#27AE60"
-                if avg_score >= 0.05
-                else ("#E74C3C" if avg_score <= -0.05 else "#95A5A6")
+                if weighted_score >= 0.05
+                else ("#E74C3C" if weighted_score <= -0.05 else "#95A5A6")
             )
             fig_gauge = go.Figure(
                 go.Indicator(
                     mode="gauge+number+delta",
-                    value=round(avg_score, 3),
+                    value=round(weighted_score, 3),
                     number={"font": {"size": 40}},
                     delta={
                         "reference": 0,
@@ -379,7 +464,12 @@ with tab_sent:
                         "decreasing": {"color": "#E74C3C"},
                     },
                     title={
-                        "text": "Average Sentiment Score<br><sup>-1 = very negative · +1 = very positive</sup>"
+                        "text": (
+                            "Like-Weighted Sentiment Score<br>"
+                            "<sup>-1 = very negative · +1 = very positive<br>"
+                            f"Flat mean: {flat_score:+.3f} · "
+                            f"Uncertain excluded ({_unc_n:,})</sup>"
+                        )
                     },
                     gauge={
                         "axis": {
@@ -395,31 +485,82 @@ with tab_sent:
                         "threshold": {
                             "line": {"color": "#2C3E50", "width": 3},
                             "thickness": 0.8,
-                            "value": avg_score,
+                            "value": weighted_score,
                         },
                     },
                 )
             )
             st.plotly_chart(fig_gauge, use_container_width=True)
 
+        # ── Gap signal ──────────────────────────────────────────────────────────
+        gm1, gm2, gm3 = st.columns(3)
+        gm1.metric("Like-Weighted Score", f"{weighted_score:+.3f}")
+        gm2.metric("Flat Mean Score",     f"{flat_score:+.3f}")
+        gm3.metric("Gap (weighted − flat)", f"{gap:+.3f}",
+                   delta=f"{'↑ liked comments more positive' if gap > 0 else '↓ liked comments more negative'}"
+                   if abs(gap) >= SENTIMENT_GAP_THRESHOLD else None)
+
+        if abs(gap) >= SENTIMENT_GAP_THRESHOLD:
+            if gap > 0:
+                st.warning(
+                    f"**Endorsed majority is more positive than average** (gap {gap:+.3f}): "
+                    "the comments fans actively liked skew more positive than the full distribution. "
+                    "The community is amplifying optimism — critics may be posting but not resonating."
+                )
+            else:
+                st.warning(
+                    f"**Loud minority signal detected** (gap {gap:+.3f}): "
+                    "the comments fans liked are notably more negative than the flat average. "
+                    "Even fans who aren't posting criticism are endorsing it — a concern worth monitoring."
+                )
+
+        # ── Trend ───────────────────────────────────────────────────────────────
+        # aggregate_sentiment_over_time returns avg_sentiment (like-weighted)
+        # and flat_avg_sentiment so both can be plotted for consistency with
+        # the headline gauge numbers.
         timeline_df = aggregate_sentiment_over_time(videos_df, adf)
         if not timeline_df.empty:
             st.subheader("Sentiment Trend Across Videos")
+            st.caption(
+                "Solid line = like-weighted mean · Dashed = flat mean · "
+                "Uncertain comments excluded. Gap between lines indicates where "
+                "liked and average-comment sentiment diverge."
+            )
+            # Round for cleaner hover display
+            timeline_df["flat_avg_sentiment"] = timeline_df["flat_avg_sentiment"].round(3)
+            timeline_df["avg_sentiment"] = timeline_df["avg_sentiment"].round(3)
+
             fig_trend = px.line(
                 timeline_df,
                 x="published_at",
                 y="avg_sentiment",
                 markers=True,
-                hover_data=["title", "comment_count", "positive_pct", "negative_pct"],
+                hover_data={
+                    "title": True,
+                    "comment_count": True,
+                    "positive_pct": True,
+                    "negative_pct": True,
+                    "flat_avg_sentiment": True,
+                },
                 labels={
                     "published_at": "Published",
-                    "avg_sentiment": "Avg Sentiment Score",
+                    "avg_sentiment": "Like-Weighted Sentiment",
+                    "flat_avg_sentiment": "Flat Mean",
                 },
-                title="How fan sentiment has changed video-by-video",
+                title="Fan sentiment per video (like-weighted, confident comments only)",
+            )
+            # Flat mean as secondary dashed trace
+            fig_trend.add_scatter(
+                x=timeline_df["published_at"],
+                y=timeline_df["flat_avg_sentiment"],
+                mode="lines",
+                name="Flat mean",
+                line=dict(color="#BDC3C7", width=1.5, dash="dash"),
+                hovertemplate="Flat: %{y:.3f}<extra></extra>",
             )
             fig_trend.add_hline(
                 y=0,
-                line_dash="dash",
+                line_dash="dot",
                 line_color="#95A5A6",
                 annotation_text="Neutral",
             )
@@ -432,277 +573,464 @@ with tab_sent:
             st.plotly_chart(fig_trend, use_container_width=True)
 
         # Model attribution
-        has_roberta = "roberta_compound" in adf.columns
-        if has_roberta:
-            st.caption("Sentiment model: **RoBERTa** (cardiffnlp/twitter-roberta-base-sentiment-latest) · VADER retained as baseline")
-        else:
-            st.caption("Sentiment model: **VADER** (RoBERTa unavailable — check that `transformers` and `torch` are installed)")
+        st.caption(
+            "Sentiment: **RoBERTa** (cardiffnlp/twitter-roberta-base-sentiment-latest) EN · "
+            "**XLM-RoBERTa** (cardiffnlp/twitter-xlm-roberta-base-sentiment) non-EN · "
+            "Emotion: **DistilRoBERTa** (j-hartmann/emotion-english-distilroberta-base) · "
+            f"Uncertain threshold: max class prob < {UNCERTAIN_THRESHOLD:.0%}"
+        )
 
+        # ── Global emotion distribution ──────────────────────────────────────────
+        _has_emotion = "emotion" in adf.columns and adf["emotion"].notna().any()
+        if _has_emotion:
+            st.subheader("Emotion Distribution")
+            emo_counts = (
+                adf["emotion"].dropna().value_counts().reset_index()
+            )
+            emo_counts.columns = ["emotion", "count"]
+            emo_counts["pct"] = (emo_counts["count"] / emo_counts["count"].sum() * 100).round(1)
+
+            fig_emo = px.bar(
+                emo_counts,
+                x="emotion",
+                y="count",
+                color="emotion",
+                color_discrete_map=EMOTION_COLORS,
+                text=emo_counts["pct"].apply(lambda p: f"{p:.1f}%"),
+                title="Fan Comment Emotion Breakdown (all clean comments)",
+                labels={"count": "Comments", "emotion": "Emotion"},
+                category_orders={"emotion": list(EMOTION_LABELS)},
+            )
+            fig_emo.update_traces(textposition="outside")
+            fig_emo.update_layout(showlegend=False, xaxis_title="")
+            st.plotly_chart(fig_emo, use_container_width=True)
+
+        # ── Video Deep Dive ──────────────────────────────────────────────────────
+        st.subheader("Video Deep Dive")
+        _vid_options = (
+            videos_df[["video_id", "title"]].drop_duplicates()
+            if not videos_df.empty
+            else pd.DataFrame()
+        )
+        if _vid_options.empty or "video_id" not in adf.columns:
+            st.info("Load data to enable per-video drill-down.")
+        else:
+            _sel_title = st.selectbox(
+                "Select a video",
+                _vid_options["title"].tolist(),
+                key="deepdive_video",
+            )
+            _sel_vid_id = _vid_options.loc[
+                _vid_options["title"] == _sel_title, "video_id"
+            ].iloc[0]
+            _vid_comments = adf[adf["video_id"] == _sel_vid_id]
+
+            if _vid_comments.empty:
+                st.info("No clean comments for this video.")
+            else:
+                _vw, _vf = weighted_mean_sentiment(_vid_comments[_vid_comments["sentiment_label"] != "Uncertain"])
+                _v_unc = (_vid_comments["sentiment_label"] == "Uncertain").sum()
+                _v_total = len(_vid_comments)
+
+                vm1, vm2, vm3 = st.columns(3)
+                vm1.metric("Comments (clean)", f"{_v_total:,}")
+                vm2.metric("Like-Weighted Sentiment", f"{_vw:+.3f}")
+                vm3.metric("Uncertain", f"{_v_unc:,}", f"{_v_unc/_v_total*100:.1f}%")
+
+                dd_col1, dd_col2 = st.columns(2)
+
+                with dd_col1:
+                    _v_sent = _vid_comments["sentiment_label"].value_counts().reset_index()
+                    _v_sent.columns = ["label", "count"]
+                    fig_v_sent = px.bar(
+                        _v_sent,
+                        x="label",
+                        y="count",
+                        color="label",
+                        color_discrete_map={
+                            "Positive": "#27AE60", "Neutral": "#95A5A6",
+                            "Negative": "#E74C3C", "Uncertain": "#9B59B6",
+                        },
+                        title="Sentiment breakdown",
+                        labels={"label": "", "count": "Comments"},
+                    )
+                    fig_v_sent.update_layout(showlegend=False)
+                    st.plotly_chart(fig_v_sent, use_container_width=True)
+
+                with dd_col2:
+                    if _has_emotion and "emotion" in _vid_comments.columns:
+                        _v_emo = (
+                            _vid_comments["emotion"].dropna()
+                            .value_counts().reset_index()
+                        )
+                        _v_emo.columns = ["emotion", "count"]
+                        fig_v_emo = px.bar(
+                            _v_emo,
+                            x="emotion",
+                            y="count",
+                            color="emotion",
+                            color_discrete_map=EMOTION_COLORS,
+                            title="Emotion breakdown",
+                            labels={"emotion": "", "count": "Comments"},
+                            category_orders={"emotion": list(EMOTION_LABELS)},
+                        )
+                        fig_v_emo.update_layout(showlegend=False)
+                        st.plotly_chart(fig_v_emo, use_container_width=True)
+                    else:
+                        st.info("Emotion data not available (VADER path or model not loaded).")
+
+                # Sample comments by dominant emotion for this video
+                if _has_emotion and "emotion" in _vid_comments.columns:
+                    st.markdown("##### Sample Comments by Emotion")
+                    _dom_emotions = (
+                        _vid_comments["emotion"].dropna()
+                        .value_counts().head(4).index.tolist()
+                    )
+                    emo_tabs = st.tabs([e.capitalize() for e in _dom_emotions])
+                    for tab, emo in zip(emo_tabs, _dom_emotions):
+                        with tab:
+                            _emo_sample = (
+                                _vid_comments[_vid_comments["emotion"] == emo]
+                                .nlargest(5, "like_count")
+                            )
+                            for _, row in _emo_sample.iterrows():
+                                score_str = f" · sentiment {row['sentiment_score']:+.2f}" if "sentiment_score" in row else ""
+                                st.markdown(
+                                    f"**{row['author']}**{score_str} · "
+                                    f"{int(row.get('like_count', 0))} likes\n\n"
+                                    f"{str(row['text'])[:300]}"
+                                )
+                                st.divider()
+
+        # ── Sample comments — three panes ───────────────────────────────────────
         st.subheader("Sample Comments")
-        col_pos, col_neg = st.columns(2)
+        col_pos, col_neg, col_unc = st.columns(3)
 
         with col_pos:
             st.markdown("##### Most Positive")
-            for _, row in adf.nlargest(5, "sentiment_score").iterrows():
+            for _, row in cdf.nlargest(5, "sentiment_score").iterrows():
                 st.success(
                     f"**{row['author']}** · score {row['sentiment_score']:+.2f}\n\n{str(row['text'])[:250]}"
                 )
 
         with col_neg:
             st.markdown("##### Most Critical")
-            for _, row in adf.nsmallest(5, "sentiment_score").iterrows():
+            for _, row in cdf.nsmallest(5, "sentiment_score").iterrows():
                 st.error(
                     f"**{row['author']}** · score {row['sentiment_score']:+.2f}\n\n{str(row['text'])[:250]}"
                 )
 
-        # VADER vs RoBERTa disagreement chart — only shown when both ran
-        if has_roberta:
-            st.subheader("Where VADER and RoBERTa Disagree")
-            st.caption(
-                "Comments far from the diagonal are where RoBERTa's social-media training matters most — "
-                "sarcasm, slang, and context that confuse a rule-based lexicon."
-            )
-            fig_cmp = px.scatter(
-                adf,
-                x="vader_compound",
-                y="roberta_compound",
-                color="sentiment_label",
-                color_discrete_map={
-                    "Positive": "#27AE60",
-                    "Neutral": "#95A5A6",
-                    "Negative": "#E74C3C",
-                },
-                hover_data=["author", "text"],
-                opacity=0.6,
-                labels={
-                    "vader_compound": "VADER score",
-                    "roberta_compound": "RoBERTa score",
-                    "sentiment_label": "Label (RoBERTa)",
-                },
-                title="VADER vs RoBERTa Scores — points off the diagonal = model disagreement",
-            )
-            # Perfect-agreement diagonal
-            fig_cmp.add_shape(
-                type="line", x0=-1, y0=-1, x1=1, y1=1,
-                line=dict(color="#BDC3C7", width=1, dash="dash"),
-            )
-            fig_cmp.add_vline(x=0, line_dash="dot", line_color="#BDC3C7", line_width=1)
-            fig_cmp.add_hline(y=0, line_dash="dot", line_color="#BDC3C7", line_width=1)
-            st.plotly_chart(fig_cmp, use_container_width=True)
+        with col_unc:
+            st.markdown("##### Uncertain")
+            unc_sample = adf[adf["sentiment_label"] == "Uncertain"].head(5)
+            if unc_sample.empty:
+                st.info("No uncertain comments in this dataset.")
+            else:
+                for _, row in unc_sample.iterrows():
+                    prob_str = (
+                        f"pos {row['pos_prob']:.2f} / neu {row['neu_prob']:.2f} / neg {row['neg_prob']:.2f}"
+                        if "pos_prob" in row
+                        else ""
+                    )
+                    st.warning(
+                        f"**{row['author']}**"
+                        + (f" · {prob_str}" if prob_str else "")
+                        + f"\n\n{str(row['text'])[:250]}"
+                    )
+
 
 
 # ┌─ Top Fans ───────────────────────────────────────────────────────────────────
+# "Super fan" is now defined as membership in the Advocates segment — a data-
+# driven label that emerges from the actual fan distribution rather than the
+# previous magic-number thresholds (comment_count >= 2 AND sentiment >= 0.05).
 with tab_fans:
     if adf.empty:
-        st.warning("No comments passed the spam/duplicate filter — cannot identify top fans.")
+        st.warning("No comments passed the spam/duplicate filter — cannot segment fans.")
+    elif not fan_segments or not fan_segments.get("clusters"):
+        st.info(
+            "Fan segmentation not available — corpus may be too small or "
+            "scikit-learn is not installed."
+        )
     else:
-        st.subheader("Most Active Community Members")
-        top_fans_df = get_top_fans(adf, top_n=20)
+        _clusters   = fan_segments["clusters"]
+        _fans_df    = fan_segments["fans_df"]
+        _k_log      = fan_segments["k_log"]
+        _k_chosen   = fan_segments["k_chosen"]
+        _n_fans     = len(_fans_df)
 
-        if top_fans_df.empty:
-            st.info("Not enough comment data to build a fan leaderboard.")
-        else:
-            col_chart, col_table = st.columns([3, 2])
+        st.subheader("Fan Community Segments")
+        st.caption(
+            f"k-means · k={_k_chosen} · {_n_fans:,} unique commenters · "
+            "features z-scored · random_state=42 (deterministic) · "
+            "segments computed during ingestion, not page load"
+        )
 
-            with col_chart:
-                fig_fans = px.bar(
-                    top_fans_df.head(15),
-                    x="comment_count",
-                    y="author",
-                    orientation="h",
-                    color="avg_sentiment",
-                    color_continuous_scale=[
-                        [0, "#E74C3C"],
-                        [0.5, "#BDC3C7"],
-                        [1, "#27AE60"],
-                    ],
-                    color_continuous_midpoint=0,
-                    range_color=[-0.6, 0.6],
-                    title="Top 15 Fans by Comment Volume (color = avg sentiment)",
-                    labels={
-                        "comment_count": "Comments",
-                        "author": "",
-                        "avg_sentiment": "Avg Sentiment",
-                    },
+        # ── K-selection log ──────────────────────────────────────────────────
+        if _k_log:
+            with st.expander("K-selection log — silhouette + inertia per k tried"):
+                st.caption(
+                    "Silhouette maximised to select k. "
+                    "Inertia logged as elbow sanity-check (not used for selection)."
                 )
-                fig_fans.update_layout(yaxis_categoryorder="total ascending")
-                st.plotly_chart(fig_fans, use_container_width=True)
+                log_df = pd.DataFrame(_k_log)
+                log_df["chosen"] = log_df["k"] == _k_chosen
+                st.dataframe(
+                    log_df.style.apply(
+                        lambda r: ["font-weight: bold"] * len(r) if r["chosen"] else [""] * len(r),
+                        axis=1,
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
-            with col_table:
-                st.markdown("##### Fan Leaderboard")
-                display = top_fans_df[
-                    [
-                        "author",
-                        "comment_count",
-                        "videos_commented",
-                        "avg_sentiment",
-                        "total_likes_received",
-                    ]
-                ].copy()
-                display.columns = [
-                    "Fan",
-                    "Comments",
-                    "Videos",
-                    "Avg Sentiment",
-                    "Likes Earned",
-                ]
-                st.dataframe(display, use_container_width=True, hide_index=True)
-
-            st.subheader("Super Fans")
-            st.caption(
-                "High activity + positive sentiment — ideal for shout-outs, giveaways, or ambassador programs"
+        # ── Segment cards ────────────────────────────────────────────────────
+        st.subheader("Segments")
+        for cluster in _clusters:
+            pct = cluster["size"] / _n_fans * 100
+            header = (
+                f"{cluster['label']} · "
+                f"{cluster['size']} fans ({pct:.0f}%) · "
+                f"mean sentiment {cluster['mean_sentiment']:+.3f}"
             )
+            with st.expander(header, expanded=True):
+                # Action — hard requirement: always shown, never blank
+                st.info(f"**Recommended action:** {cluster['action']}")
 
-            super_fans = top_fans_df[
-                (top_fans_df["comment_count"] >= 2)
-                & (top_fans_df["avg_sentiment"] >= 0.05)
-            ].head(10)
+                left_col, right_col = st.columns([1, 1])
 
-            if super_fans.empty:
-                st.info(
-                    "No super fans identified yet — try increasing the comments-per-video limit."
-                )
-            else:
-                for rank, (_, fan) in enumerate(super_fans.iterrows(), 1):
-                    emoji = "🟢" if fan["avg_sentiment"] > 0.2 else "🟡"
-                    st.markdown(
-                        f"**#{rank} {fan['author']}** {emoji} — "
-                        f"{int(fan['comment_count'])} comments across {int(fan['videos_commented'])} video(s) · "
-                        f"Sentiment: {fan['avg_sentiment']:+.3f} · "
-                        f"Likes earned: {int(fan['total_likes_received'])}"
+                with left_col:
+                    # Centroid profile: z-scores relative to the average fan
+                    z_vals = [cluster["centroid_z"][f] for f in cluster["centroid_z"]]
+                    f_labels = [FEATURE_DISPLAY.get(f, f) for f in cluster["centroid_z"]]
+                    bar_colors = ["#27AE60" if v >= 0 else "#E74C3C" for v in z_vals]
+
+                    fig_cent = go.Figure(
+                        go.Bar(
+                            x=z_vals,
+                            y=f_labels,
+                            orientation="h",
+                            marker_color=bar_colors,
+                            hovertemplate="%{y}: %{x:+.2f}σ<extra></extra>",
+                        )
+                    )
+                    fig_cent.add_vline(x=0, line_dash="dash", line_color="#95A5A6")
+                    fig_cent.update_layout(
+                        title="Centroid profile (σ from average fan)",
+                        xaxis=dict(range=[-2.5, 2.5], title="Standard deviations"),
+                        yaxis_title="",
+                        height=260,
+                        margin=dict(l=0, r=0, t=30, b=0),
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig_cent, use_container_width=True)
+
+                    # Original-unit centroid for reference
+                    orig = cluster["centroid"]
+                    st.caption(
+                        f"comments: {orig['comment_count']:.1f} · "
+                        f"videos: {orig['videos_commented']:.1f} · "
+                        f"sentiment: {orig['avg_sentiment']:+.3f} · "
+                        f"likes: {orig['likes_earned']:.0f} · "
+                        f"recency: {orig['recency']:.0f} days · "
+                        f"consistency: {orig['consistency']:.1f} weeks"
                     )
 
-            if len(top_fans_df) >= 5:
-                st.subheader("Fan Activity vs Sentiment")
-                fig_fan_scatter = px.scatter(
-                    top_fans_df,
-                    x="comment_count",
-                    y="avg_sentiment",
-                    size="total_likes_received",
-                    size_max=40,
-                    text="author",
-                    color="avg_sentiment",
-                    color_continuous_scale=[
-                        [0, "#E74C3C"],
-                        [0.5, "#BDC3C7"],
-                        [1, "#27AE60"],
-                    ],
-                    color_continuous_midpoint=0,
-                    range_color=[-0.6, 0.6],
-                    title="Fan Activity vs Sentiment (bubble = likes received on comments)",
-                    labels={
-                        "comment_count": "# Comments",
-                        "avg_sentiment": "Avg Sentiment Score",
-                    },
-                )
-                fig_fan_scatter.add_hline(
-                    y=0, line_dash="dash", line_color="#95A5A6"
-                )
-                fig_fan_scatter.update_traces(
-                    textposition="top center", textfont_size=9
-                )
-                st.plotly_chart(fig_fan_scatter, use_container_width=True)
+                with right_col:
+                    st.markdown("**Representative fans** (closest to centroid)")
+                    for fan in cluster["examples"]:
+                        sent_str = f"{fan['avg_sentiment']:+.3f}" if fan.get("avg_sentiment") is not None else "—"
+                        st.markdown(
+                            f"**{fan['author']}** · "
+                            f"{int(fan['comment_count'])} comments · "
+                            f"{int(fan['videos_commented'])} videos · "
+                            f"sentiment {sent_str} · "
+                            f"{int(fan['likes_earned'])} likes · "
+                            f"{int(fan['recency'])}d ago"
+                        )
+
+        # ── Scatter: all fans, colored by segment ────────────────────────────
+        if len(_fans_df) >= 5:
+            st.subheader("Fan Map — Activity × Sentiment")
+            st.caption("Bubble size = likes earned · color = segment")
+
+            _color_map = {c["label"]: c["color"] for c in _clusters}
+            fig_scatter = px.scatter(
+                _fans_df,
+                x="comment_count",
+                y="avg_sentiment",
+                size="likes_earned",
+                size_max=40,
+                color="cluster_label",
+                color_discrete_map=_color_map,
+                hover_data={
+                    "author": True,
+                    "videos_commented": True,
+                    "likes_earned": True,
+                    "recency": True,
+                    "consistency": True,
+                },
+                title="Fan Activity vs Sentiment (all segmented commenters)",
+                labels={
+                    "comment_count":  "Comments",
+                    "avg_sentiment":  "Avg Sentiment",
+                    "cluster_label":  "Segment",
+                    "likes_earned":   "Likes",
+                    "recency":        "Days ago",
+                    "consistency":    "Weeks active",
+                },
+            )
+            fig_scatter.add_hline(y=0, line_dash="dash", line_color="#95A5A6")
+            st.plotly_chart(fig_scatter, use_container_width=True)
+
+        # ── Fan lookup table ─────────────────────────────────────────────────
+        st.subheader("Fan Lookup")
+        st.caption("Full table — sort any column, search by name in your browser")
+        _display_fans = _fans_df[[
+            "author", "cluster_label", "comment_count", "videos_commented",
+            "avg_sentiment", "likes_earned", "recency", "consistency",
+        ]].copy()
+        _display_fans.columns = [
+            "Fan", "Segment", "Comments", "Videos",
+            "Avg Sentiment", "Likes Earned", "Days Since Last", "Weeks Active",
+        ]
+        _display_fans = _display_fans.sort_values("Comments", ascending=False).reset_index(drop=True)
+        st.dataframe(_display_fans, use_container_width=True, hide_index=True)
 
 
 # ┌─ Trending Topics ─────────────────────────────────────────────────────────────
 with tab_topics:
     if adf.empty:
         st.warning("No comments passed the spam/duplicate filter — cannot extract topics.")
+    elif topics_df.empty:
+        st.info(
+            "Semantic topic model returned no topics — corpus may be too small "
+            "or BERTopic dependencies are not installed. "
+            "Install with: `pip install bertopic sentence-transformers`"
+        )
     else:
-        st.subheader("What Fans Are Talking About")
-        topics_df = get_trending_topics(adf, top_n=30)
+        st.subheader("Semantic Topics in Fan Comments")
+        st.caption(
+            "BERTopic · all-MiniLM-L6-v2 embeddings · TruncatedSVD (UMAP-free) · "
+            "KeyBERTInspired labels · prominence = Σ log(1 + likes) · "
+            "sentiment requires ≥ 20 confident comments per topic"
+        )
 
-        if topics_df.empty:
-            st.info("Not enough comment text to extract topics.")
-        else:
-            col_bar, col_stats = st.columns([3, 1])
+        # ── Action signal color map ───────────────────────────────────────────────
+        def _topic_color(action: str) -> str:
+            if action.startswith("✅"):
+                return "#27AE60"
+            if action.startswith("⚠️"):
+                return "#E74C3C"
+            if action.startswith("🔵"):
+                return "#3498DB"
+            return "#BDC3C7"
 
-            with col_bar:
-                fig_topics = px.bar(
-                    topics_df,
-                    x="count",
-                    y="word",
-                    orientation="h",
-                    color="count",
-                    color_continuous_scale="Tealgrn",
-                    title="Top 30 Keywords in Fan Comments",
-                    labels={"count": "Mentions", "word": ""},
-                )
-                fig_topics.update_layout(
-                    yaxis_categoryorder="total ascending",
-                    showlegend=False,
-                    height=700,
-                )
-                st.plotly_chart(fig_topics, use_container_width=True)
+        topic_colors = topics_df["action"].apply(_topic_color).tolist()
 
-            with col_stats:
-                st.markdown("##### Quick Stats")
-                total_words = topics_df["count"].sum()
-                for _, row in topics_df.head(10).iterrows():
-                    pct = row["count"] / total_words * 100
-                    st.metric(row["word"], f"{row['count']:,}", f"{pct:.1f}% share")
-
-            st.subheader("Keyword Sentiment Breakdown")
-            st.caption(
-                "How fans feel when each keyword appears — spot what to amplify vs. watch"
+        # ── Prominence bar chart ─────────────────────────────────────────────────
+        fig_prom = go.Figure(
+            go.Bar(
+                x=topics_df["prominence"],
+                y=topics_df["label"],
+                orientation="h",
+                marker_color=topic_colors,
+                customdata=topics_df[["n_comments", "n_certain", "action"]].values,
+                hovertemplate=(
+                    "<b>%{y}</b><br>"
+                    "Prominence: %{x:.1f}<br>"
+                    "Comments: %{customdata[0]}<br>"
+                    "Certain: %{customdata[1]}<br>"
+                    "Signal: %{customdata[2]}<extra></extra>"
+                ),
             )
+        )
+        fig_prom.update_layout(
+            title="Topic Prominence (Σ log(1+likes) — like-weighted size)",
+            xaxis_title="Prominence",
+            yaxis_categoryorder="total ascending",
+            height=max(350, len(topics_df) * 28),
+            showlegend=False,
+            margin=dict(l=0),
+        )
+        st.plotly_chart(fig_prom, use_container_width=True)
 
-            kw_sentiment = keyword_sentiment_breakdown(
-                adf, topics_df.head(15)["word"].tolist()
+        # ── Sentiment scatter (topics with enough certain comments) ───────────────
+        scored_topics = topics_df[topics_df["has_sentiment"]].copy()
+        if not scored_topics.empty:
+            st.subheader("Topic Sentiment vs Prominence")
+            fig_tsent = px.scatter(
+                scored_topics,
+                x="prominence",
+                y="weighted_sentiment",
+                size="n_comments",
+                size_max=50,
+                text="label",
+                color="weighted_sentiment",
+                color_continuous_scale=[
+                    [0, "#E74C3C"],
+                    [0.5, "#BDC3C7"],
+                    [1, "#27AE60"],
+                ],
+                color_continuous_midpoint=0,
+                range_color=[-0.6, 0.6],
+                hover_data={"n_comments": True, "n_certain": True, "flat_sentiment": True},
+                title="Topic Size vs Like-Weighted Sentiment (bubble = comment count)",
+                labels={
+                    "prominence": "Prominence (Σ log(1+likes))",
+                    "weighted_sentiment": "Like-Weighted Sentiment",
+                    "n_comments": "Comments",
+                    "n_certain": "Certain",
+                    "flat_sentiment": "Flat Mean",
+                },
             )
+            fig_tsent.add_hline(
+                y=0, line_dash="dash", line_color="#95A5A6", annotation_text="Neutral"
+            )
+            fig_tsent.update_traces(textposition="top center", textfont_size=9)
+            st.plotly_chart(fig_tsent, use_container_width=True)
 
-            if not kw_sentiment.empty:
-                fig_kw = px.scatter(
-                    kw_sentiment,
-                    x="mentions",
-                    y="avg_sentiment",
-                    size="mentions",
-                    size_max=50,
-                    text="keyword",
-                    color="avg_sentiment",
-                    color_continuous_scale=[
-                        [0, "#E74C3C"],
-                        [0.5, "#BDC3C7"],
-                        [1, "#27AE60"],
-                    ],
-                    color_continuous_midpoint=0,
-                    range_color=[-0.5, 0.5],
-                    title="Keyword Frequency vs Associated Sentiment",
-                    labels={
-                        "mentions": "Mentions",
-                        "avg_sentiment": "Avg Sentiment Score",
-                    },
-                )
-                fig_kw.add_hline(
-                    y=0,
-                    line_dash="dash",
-                    line_color="#95A5A6",
-                    annotation_text="Neutral",
-                )
-                fig_kw.update_traces(textposition="top center", textfont_size=11)
-                st.plotly_chart(fig_kw, use_container_width=True)
+        # ── Per-topic cards ───────────────────────────────────────────────────────
+        st.subheader("Topic Details")
+        for _, row in topics_df.iterrows():
+            action = row["action"]
+            color = _topic_color(action)
+            label = row["label"]
+            n_com = int(row["n_comments"])
+            n_cert = int(row["n_certain"])
+            prom = float(row["prominence"])
 
-                kw_sentiment["signal"] = kw_sentiment["avg_sentiment"].apply(
-                    lambda s: "✅ Amplify"
-                    if s >= 0.1
-                    else ("⚠️ Monitor" if s <= -0.1 else "🔵 Neutral")
-                )
-                kw_display = kw_sentiment[
-                    ["keyword", "mentions", "avg_sentiment", "positive_pct", "signal"]
-                ].copy()
-                kw_display.columns = [
-                    "Keyword / Phrase",
-                    "Comments",
-                    "Avg Sentiment",
-                    "Positive %",
-                    "Action",
-                ]
-                st.dataframe(kw_display, use_container_width=True, hide_index=True)
+            if row["has_sentiment"]:
+                ws = float(row["weighted_sentiment"])
+                fs = float(row["flat_sentiment"])
+                sent_str = f"weighted {ws:+.3f} · flat {fs:+.3f} · n={n_cert}"
+            else:
+                sent_str = f"{action}"  # already "— (n=X)"
 
-            # Show whether TF-IDF + bigrams are active
-            has_tfidf = "tfidf_score" in topics_df.columns
-            if has_tfidf:
-                st.caption("Ranked by TF-IDF score (unigrams + bigrams) — phrases shown where fans use them together")
+            header = f"{action}  **{label}** — {n_com} comments · prominence {prom:.1f} · {sent_str}"
+
+            with st.expander(header):
+                ex1, ex2 = st.columns([1, 1])
+                with ex1:
+                    st.markdown(f"**Action signal:** {action}")
+                    st.markdown(f"**Comments in topic:** {n_com:,}")
+                    st.markdown(f"**Certain (non-Uncertain):** {n_cert:,}")
+                    st.markdown(f"**Prominence:** {prom:.3f}")
+                    if row["has_sentiment"]:
+                        st.markdown(f"**Like-weighted sentiment:** {ws:+.3f}")
+                        st.markdown(f"**Flat mean sentiment:** {fs:+.3f}")
+                    else:
+                        st.markdown(
+                            f"**Sentiment:** not shown — fewer than 20 confident comments (n={n_cert})"
+                        )
+                with ex2:
+                    st.markdown("**Top comments by likes:**")
+                    examples = row.get("examples") or []
+                    if examples:
+                        for i, ex in enumerate(examples, 1):
+                            st.markdown(f"{i}. {str(ex)[:300]}")
+                    else:
+                        st.caption("No examples available.")
 
 
 # ┌─ All Videos ──────────────────────────────────────────────────────────────────
@@ -758,20 +1086,84 @@ with tab_table:
         )
 
         if not comments_df.empty:
-            st.subheader("All Comments")
+            st.subheader("Comment Explorer")
             st.caption(
                 f"{len(adf):,} used in analytics · "
                 f"{comments_df['is_spam'].sum():,} spam · "
                 f"{comments_df['is_duplicate'].sum():,} near-duplicates"
             )
-            cols = ["video_id", "author", "text", "is_spam", "is_duplicate",
-                    "language", "sentiment_label", "sentiment_score", "like_count", "published_at"]
-            comment_display = comments_df[[c for c in cols if c in comments_df.columns]].copy()
-            comment_display.columns = [c.replace("_", " ").title() for c in comment_display.columns]
-            st.dataframe(comment_display, use_container_width=True, hide_index=True)
+
+            # ── Filters ─────────────────────────────────────────────────────────
+            _filt_col1, _filt_col2, _filt_col3 = st.columns(3)
+
+            with _filt_col1:
+                _sent_opts = ["Positive", "Neutral", "Negative", "Uncertain"]
+                _sent_filter = st.multiselect(
+                    "Filter by sentiment",
+                    options=_sent_opts,
+                    default=[],
+                    key="explorer_sentiment",
+                )
+
+            with _filt_col2:
+                _has_emo_col = "emotion" in comments_df.columns and comments_df["emotion"].notna().any()
+                if _has_emo_col:
+                    _present_emotions = sorted(comments_df["emotion"].dropna().unique().tolist())
+                    _emo_filter = st.multiselect(
+                        "Filter by emotion",
+                        options=_present_emotions,
+                        default=[],
+                        key="explorer_emotion",
+                    )
+                else:
+                    _emo_filter = []
+                    st.caption("Emotion data not available")
+
+            with _filt_col3:
+                _spam_filter = st.selectbox(
+                    "Show",
+                    options=["Clean only", "All (including spam/dupe)", "Spam only"],
+                    key="explorer_spam",
+                )
+
+            # Apply filters
+            _explorer_df = comments_df.copy()
+            if _spam_filter == "Clean only" and "is_spam" in _explorer_df.columns:
+                _explorer_df = _explorer_df[
+                    ~_explorer_df["is_spam"] & ~_explorer_df["is_duplicate"]
+                ]
+            elif _spam_filter == "Spam only" and "is_spam" in _explorer_df.columns:
+                _explorer_df = _explorer_df[
+                    _explorer_df["is_spam"] | _explorer_df["is_duplicate"]
+                ]
+            if _sent_filter and "sentiment_label" in _explorer_df.columns:
+                _explorer_df = _explorer_df[
+                    _explorer_df["sentiment_label"].isin(_sent_filter)
+                ]
+            if _emo_filter and "emotion" in _explorer_df.columns:
+                _explorer_df = _explorer_df[
+                    _explorer_df["emotion"].isin(_emo_filter)
+                ]
+
+            st.caption(f"Showing {len(_explorer_df):,} comments")
+
+            _display_cols = [
+                "video_id", "author", "text",
+                "sentiment_label", "sentiment_score",
+                "emotion",
+                "is_spam", "is_duplicate", "language",
+                "like_count", "published_at",
+            ]
+            _comment_display = _explorer_df[
+                [c for c in _display_cols if c in _explorer_df.columns]
+            ].copy()
+            _comment_display.columns = [
+                c.replace("_", " ").title() for c in _comment_display.columns
+            ]
+            st.dataframe(_comment_display, use_container_width=True, hide_index=True)
             st.download_button(
-                "Download Comments CSV",
-                comment_display.to_csv(index=False),
-                file_name="jared_mccain_comments.csv",
+                "Download filtered CSV",
+                _comment_display.to_csv(index=False),
+                file_name="jared_mccain_comments_filtered.csv",
                 mime="text/csv",
             )

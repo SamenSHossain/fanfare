@@ -1,7 +1,12 @@
 import re
 from collections import Counter
 
+import numpy as np
 import pandas as pd
+
+# Gap between like-weighted and flat mean above which we surface the
+# "loud minority vs endorsed majority" signal to the analyst.
+SENTIMENT_GAP_THRESHOLD: float = 0.10
 
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer as _TfidfVectorizer
@@ -26,6 +31,46 @@ _STOPWORDS = {
 }
 
 
+def weighted_mean_sentiment(
+    df: pd.DataFrame,
+    score_col: str = "sentiment_score",
+    likes_col: str = "like_count",
+) -> tuple[float, float]:
+    """Return (like_weighted_mean, flat_mean) for a confident-comment DataFrame.
+
+    Weight formula: w_i = log(1 + like_count_i)
+
+    Why log, not raw likes
+    ----------------------
+    YouTube comment likes follow a heavy-tailed distribution — a handful of
+    comments accumulate thousands of likes while the median sits near zero.
+    Using raw likes as weights would hand a single viral comment (e.g. 10 000
+    likes) the same aggregate influence as hundreds of ordinary ones combined,
+    replacing the community's aggregate signal with one person's opinion.
+    log(1 + k) compresses the dynamic range: a 100-like comment gets ~5× the
+    weight of a 0-like comment rather than 100×. This keeps endorsed comments
+    meaningfully more influential than ignored ones while preventing outliers
+    from dominating. The +1 shift ensures zero-like comments contribute weight
+    log(1) = 0 (they are not excluded, but they receive no endorsement bonus).
+
+    When total weight is zero (no comment has any likes), weighted falls back
+    to the flat mean so the return value is always well-defined.
+
+    Returns (0.0, 0.0) on an empty frame.
+    """
+    if df.empty:
+        return 0.0, 0.0
+
+    scores = df[score_col].to_numpy(dtype=float)
+    weights = np.log1p(df[likes_col].clip(lower=0).to_numpy(dtype=float))
+
+    flat = float(np.mean(scores))
+    total_w = weights.sum()
+
+    weighted = flat if total_w == 0 else float(np.dot(scores, weights) / total_w)
+    return round(weighted, 4), round(flat, 4)
+
+
 def compute_engagement_rate(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     safe_views = df["view_count"].replace(0, 1)
@@ -39,20 +84,35 @@ def get_top_fans(comments_df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
     if comments_df.empty or "author" not in comments_df.columns:
         return pd.DataFrame()
 
-    agg = (
+    # comment_count and activity metrics include all clean comments
+    activity = (
         comments_df.groupby(["author", "author_channel_id"])
         .agg(
             comment_count=("text", "count"),
             videos_commented=("video_id", "nunique"),
-            avg_sentiment=("sentiment_score", "mean"),
             total_likes_received=("like_count", "sum"),
         )
         .reset_index()
-        .sort_values("comment_count", ascending=False)
-        .head(top_n)
     )
-    agg["avg_sentiment"] = agg["avg_sentiment"].round(3)
-    return agg
+
+    # avg_sentiment only from comments with a confident label — uncertain
+    # comments would pull per-fan averages toward zero the same way they
+    # distort the global average (see UNCERTAIN_THRESHOLD comment in scoring.py)
+    if "sentiment_label" in comments_df.columns and "sentiment_score" in comments_df.columns:
+        certain = comments_df[comments_df["sentiment_label"] != "Uncertain"]
+        sentiment = (
+            certain.groupby(["author", "author_channel_id"])["sentiment_score"]
+            .mean()
+            .round(3)
+            .reset_index()
+            .rename(columns={"sentiment_score": "avg_sentiment"})
+        )
+        agg = activity.merge(sentiment, on=["author", "author_channel_id"], how="left")
+    else:
+        agg = activity
+        agg["avg_sentiment"] = float("nan")
+
+    return agg.sort_values("comment_count", ascending=False).head(top_n)
 
 
 def get_trending_topics(comments_df: pd.DataFrame, top_n: int = 30) -> pd.DataFrame:
@@ -99,10 +159,27 @@ def aggregate_sentiment_over_time(
     if comments_df.empty or videos_df.empty:
         return pd.DataFrame()
 
+    # Exclude uncertain comments so they don't compress per-video averages
+    # toward zero (see UNCERTAIN_THRESHOLD comment in scoring.py for rationale)
+    if "sentiment_label" in comments_df.columns:
+        certain = comments_df[comments_df["sentiment_label"] != "Uncertain"].copy()
+    else:
+        certain = comments_df.copy()
+
+    if certain.empty:
+        return pd.DataFrame()
+
+    # Pre-compute per-row log-like weights so the weighted mean can be
+    # aggregated with standard groupby (no groupby.apply needed)
+    certain["_w"] = np.log1p(certain["like_count"].clip(lower=0))
+    certain["_wscore"] = certain["sentiment_score"] * certain["_w"]
+
     per_video = (
-        comments_df.groupby("video_id")
+        certain.groupby("video_id")
         .agg(
-            avg_sentiment=("sentiment_score", "mean"),
+            _total_w=("_w", "sum"),
+            _total_wscore=("_wscore", "sum"),
+            flat_avg_sentiment=("sentiment_score", "mean"),
             comment_count=("text", "count"),
             positive_pct=(
                 "sentiment_label",
@@ -115,6 +192,17 @@ def aggregate_sentiment_over_time(
         )
         .reset_index()
     )
+
+    # Where no comment has any likes, fall back to flat mean
+    per_video["avg_sentiment"] = per_video.apply(
+        lambda r: (
+            r["flat_avg_sentiment"]
+            if r["_total_w"] == 0
+            else r["_total_wscore"] / r["_total_w"]
+        ),
+        axis=1,
+    ).round(4)
+    per_video = per_video.drop(columns=["_total_w", "_total_wscore"])
 
     merged = videos_df[["video_id", "title", "published_at"]].merge(
         per_video, on="video_id", how="inner"

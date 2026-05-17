@@ -150,9 +150,11 @@ class YouTubeClient:
                 break
 
             for item in resp.get("items", []):
-                top = item["snippet"]["topLevelComment"]["snippet"]
+                top_comment = item["snippet"]["topLevelComment"]
+                top = top_comment["snippet"]
                 comments.append(
                     {
+                        "comment_id": top_comment.get("id", ""),
                         "video_id": video_id,
                         "author": top.get("authorDisplayName", "Unknown"),
                         "author_channel_id": top.get("authorChannelId", {}).get(
