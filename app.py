@@ -13,6 +13,12 @@ from src.analytics import (
     weighted_mean_sentiment,
 )
 from src.cleaning import clean_comments
+from src.alerts import (
+    CORRECTION_METHOD,
+    MIN_KEYWORD_MENTIONS,
+    MIN_VIDEO_COMMENTS,
+    run_alerts,
+)
 from src.fans import FEATURE_DISPLAY, run_fan_segmentation
 from src.scoring import EMOTION_LABELS, UNCERTAIN_THRESHOLD, score_comments
 from src.topics import run_topic_model
@@ -73,16 +79,16 @@ with st.sidebar:
 def load_data(
     max_vids: int,
     max_coms: int,
-) -> tuple[dict | None, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+) -> tuple[dict | None, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict, dict]:
     client = YouTubeClient(YOUTUBE_API_KEY)
 
     channel = client.get_channel_info(handle=CHANNEL_HANDLE)
     if not channel:
-        return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}
+        return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}, {}
 
     video_ids = client.get_video_ids(channel["uploads_playlist_id"], max_vids)
     if not video_ids:
-        return channel, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}
+        return channel, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}, {}
 
     videos_df = client.get_video_details(video_ids)
     if not videos_df.empty:
@@ -94,7 +100,7 @@ def load_data(
 
     raw_df = client.get_all_comments(video_ids, max_coms)
     if raw_df.empty:
-        return channel, videos_df, pd.DataFrame(), pd.DataFrame(), {}
+        return channel, videos_df, pd.DataFrame(), pd.DataFrame(), {}, {}
 
     # Stage 1: clean — adds cleaned_text, is_spam, language, is_duplicate
     records = clean_comments(raw_df.to_dict("records"))
@@ -133,7 +139,15 @@ def load_data(
     if not clean_comments_df.empty:
         fan_segments = run_fan_segmentation(clean_comments_df)
 
-    return channel, videos_df, comments_df, topics_df, fan_segments
+    # Stage 5: statistically corrected alerts.
+    # Three families (sentiment spike, velocity anomaly, keyword shift) each
+    # corrected for multiple comparisons via Bonferroni (default) or BH.
+    # Streamlit only renders the already-decided alert list.
+    alerts_result: dict = {}
+    if not clean_comments_df.empty and not videos_df.empty:
+        alerts_result = run_alerts(clean_comments_df, videos_df)
+
+    return channel, videos_df, comments_df, topics_df, fan_segments, alerts_result
 
 
 # ── Page header ────────────────────────────────────────────────────────────────
@@ -147,7 +161,7 @@ if fetch_btn:
     with st.spinner(
         f"Fetching up to {max_videos} videos and {max_comments} comments each…"
     ):
-        channel, videos_df, comments_df, topics_df, fan_segments = load_data(max_videos, max_comments)
+        channel, videos_df, comments_df, topics_df, fan_segments, alerts_result = load_data(max_videos, max_comments)
     if channel is None:
         st.error("Could not load channel @jaredmccain024. Check that the API key is valid and the channel is public.")
         st.stop()
@@ -158,6 +172,7 @@ if fetch_btn:
         comments_df=comments_df,
         topics_df=topics_df,
         fan_segments=fan_segments,
+        alerts_result=alerts_result,
         data_loaded=True,
     )
 
@@ -172,6 +187,7 @@ videos_df: pd.DataFrame = st.session_state.videos_df
 comments_df: pd.DataFrame = st.session_state.comments_df
 topics_df: pd.DataFrame = st.session_state.get("topics_df", pd.DataFrame())
 fan_segments: dict = st.session_state.get("fan_segments", {})
+alerts_result: dict = st.session_state.get("alerts_result", {})
 
 # adf: all clean (non-spam, non-duplicate), scored comments — includes Uncertain.
 #      Used for counts, topic models, fan activity, and the raw comment table.
@@ -315,9 +331,151 @@ else:
 st.divider()
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
-tab_eng, tab_sent, tab_fans, tab_topics, tab_table = st.tabs(
-    ["📊 Engagement", "💬 Sentiment", "🏆 Top Fans", "🔥 Trending Topics", "📋 All Videos"]
+tab_alerts, tab_eng, tab_sent, tab_fans, tab_topics, tab_table = st.tabs(
+    ["🔔 Alerts", "📊 Engagement", "💬 Sentiment", "🏆 Top Fans", "🔥 Trending Topics", "📋 All Videos"]
 )
+
+# ┌─ Alerts ─────────────────────────────────────────────────────────────────────
+with tab_alerts:
+    st.subheader("Signal Alerts")
+    st.caption(
+        "Three families of hypothesis tests, each corrected for multiple comparisons. "
+        "An alert fires only when the signal clears the corrected threshold **and** "
+        "the effect size is large enough to act on.  "
+        f"Correction method: **{CORRECTION_METHOD.upper()}** (edit `CORRECTION_METHOD` in `src/alerts.py` to switch to BH / FDR)."
+    )
+
+    if not alerts_result:
+        st.info("Run **Fetch & Analyze** to generate alerts.")
+    else:
+        _a_alerts   = alerts_result.get("alerts", [])
+        _a_summary  = alerts_result.get("summary", {})
+        _a_families = alerts_result.get("families", {})
+        _a_method   = alerts_result.get("correction", CORRECTION_METHOD)
+
+        _tested  = _a_summary.get("tested", 0)
+        _passed  = _a_summary.get("passed", 0)
+        _naive   = _a_summary.get("naive_count", 0)
+        _blocked = _naive - _passed
+
+        # ── Summary banner ───────────────────────────────────────────────────
+        st.markdown(
+            f"**{_tested} potential signals tested · "
+            f"{_passed} passed {_a_method.upper()} correction**"
+            + (f" · {_blocked} suppressed vs. naïve α=0.05" if _blocked > 0 else
+               " · same count as naïve α=0.05 (no inflation detected)")
+        )
+
+        # Per-family breakdown
+        fam_cols = st.columns(3)
+        _fam_labels = {
+            "sentiment_spike":  "Sentiment spike",
+            "velocity_anomaly": "Velocity anomaly",
+            "keyword_shift":    "Keyword shift",
+        }
+        for col, (fam_key, fam_label) in zip(fam_cols, _fam_labels.items()):
+            fam = _a_families.get(fam_key, {})
+            with col:
+                st.metric(
+                    fam_label,
+                    f"{fam.get('corrected_pass', 0)} / {fam.get('m', 0)} tests",
+                    delta=f"naïve: {fam.get('naive_pass', 0)}",
+                )
+                st.caption(fam.get("description", ""))
+
+        st.divider()
+
+        if not _a_alerts:
+            st.success(
+                "No signals cleared the corrected threshold this run — "
+                "the channel is performing within its normal statistical range."
+            )
+        else:
+            _FAMILY_ICON = {
+                "sentiment_spike":  "💬",
+                "velocity_anomaly": "📈",
+                "keyword_shift":    "🔑",
+            }
+            for alert in _a_alerts:
+                fam   = alert["family"]
+                sev   = alert.get("severity", "info")
+                icon  = _FAMILY_ICON.get(fam, "🔔")
+                title = alert["title"]
+
+                with st.expander(f"{icon} {title}", expanded=True):
+                    left, right = st.columns([3, 2])
+
+                    with left:
+                        # Recommended action — always present (contract enforced in alerts.py)
+                        if sev == "warning":
+                            st.warning(f"**Recommended action:** {alert['action']}")
+                        else:
+                            st.info(f"**Recommended action:** {alert['action']}")
+
+                    with right:
+                        st.markdown(f"**What changed:** {alert['magnitude_label']}")
+                        st.markdown(f"**Sample size (n):** {alert['n']:,} comments")
+
+                        method = alert.get("correction_method", _a_method)
+                        raw_p  = alert.get("p_raw")
+                        adj_p  = alert.get("p_adj")
+                        thresh = alert.get("corrected_threshold")
+
+                        if fam == "velocity_anomaly":
+                            # z-score family: no formal p-value
+                            st.markdown(
+                                f"**Corrected threshold cleared:** {thresh}  \n"
+                                f"**Normal-approx p (reference only):** {raw_p:.5f}"
+                            )
+                        else:
+                            st.markdown(
+                                f"**Raw p-value:** {raw_p:.5f}  \n"
+                                f"**Adjusted p ({method}):** {adj_p:.5f}  \n"
+                                f"**Corrected threshold:** {thresh:.5f}"
+                            )
+
+        # ── Methodology note ─────────────────────────────────────────────────
+        with st.expander("Methodology — how correction works"):
+            st.markdown(
+                """
+**Why multiple-comparisons correction?**
+Every ingestion run tests many hypotheses simultaneously — one per video
+(sentiment), one per video (velocity), one per keyword.  At a naïve α = 0.05
+threshold, with no true change you'd still expect 5 % of tests to fire by
+chance.  Across 50 videos that's ~2–3 phantom alerts per run even in a
+completely uneventful week.
+
+**Bonferroni (default)**
+Per-test threshold = α / m (where m = tests in the family).
+Controls FWER: the probability of *any* false positive in the family ≤ α.
+Conservative — may suppress real signals when many genuine changes occur.
+
+**Benjamini-Hochberg (BH)**
+Controls FDR ≤ α: the *expected fraction* of fired alerts that are false
+positives.  Fires more alerts when many real changes happen simultaneously.
+Switch by setting `CORRECTION_METHOD = "bh"` in `src/alerts.py`.
+
+**Velocity family (z-score, no formal p-value)**
+Comment counts are right-skewed (Poisson-ish), so a t-test would be
+misleading.  Instead we use z-score vs. the channel distribution and
+translate the Bonferroni correction to an equivalent sigma threshold:
+z* = Φ⁻¹(1 − α/(2m)).  This approximation is conservative (real tails
+are heavier than normal) — we tend to under-fire, not over-fire.
+
+**Sample guard**
+No alert fires from fewer than {min_video} comments (sentiment / velocity)
+or {min_kw} keyword mentions.  Sample size is shown on every alert.
+
+**Effect-size gate**
+Applied *after* correction: a statistically significant but negligible
+change (|Δ| < 0.08 sentiment points) is not surfaced.  This prevents
+large-n trivial effects from flooding the feed.
+""".format(
+                    min_video=MIN_VIDEO_COMMENTS,
+                    min_kw=MIN_KEYWORD_MENTIONS,
+                )
+            )
+
 
 # ┌─ Engagement ─────────────────────────────────────────────────────────────────
 with tab_eng:
