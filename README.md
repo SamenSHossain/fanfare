@@ -4,6 +4,20 @@ YouTube fan intelligence dashboard for **Jared McCain** — built for marketing 
 
 ---
 
+## Roadmap
+
+The three highest-value additions with more time, in priority order:
+
+- **Cross-channel benchmarking.** The sentiment score and engagement rate only matter relative to something. Pull two or three comparable athletes (Scoot Henderson, Paolo Banchero) and overlay their numbers so the lead can answer "are we at 72% positive because we're doing well, or because sports YouTube skews positive in general?" Without a baseline, a single number tells you nothing.
+
+- **Scheduled weekly digest.** The lead shouldn't have to open a dashboard to stay informed. A Monday-morning Slack or email summarising what changed since last week — which alert fired, which video outperformed, whether sentiment trended up or down — closes the action loop entirely. The data pipeline is already built; it just needs a trigger and a formatter.
+
+- **Reply draft suggestions.** The hardest part of community management isn't knowing which comments to respond to — it's writing the response. Pipe the top positive and critical comments through an LLM to draft reply copy. The fan segmentation already identifies which commenters are worth prioritising (Advocates vs. At-Risk); the LLM step turns that signal into something the social team can act on in 30 seconds.
+
+- **Shorts vs. long-form split.** Shorts and long-form videos attract different audiences and drive fundamentally different comment behaviour. A 60-second highlight gets reactive emoji comments; a 20-minute breakdown gets substantive fan discussion. Mixing them in a single sentiment average obscures both signals.
+
+---
+
 ## Quick start (no setup required)
 
 The API key and channel are pre-configured. Clone the repo, install dependencies, and run:
